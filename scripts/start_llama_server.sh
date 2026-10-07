@@ -52,7 +52,7 @@ MODEL="$BONSAI_SPLASH_MODEL"
 CTX="$CTX_SIZE_DEFAULT"
 _IMG="$(bonsai_image_max_pixels)"          # BONSAI_IMAGE_MAX_TOKENS -> pixels
 _IDLE="${BONSAI_IDLE_RELEASE:-off}"        # keep the model loaded (old behavior)
-_EFFORT=""
+_EFFORT="low"   # default thinking level when no reasoning flag is supplied
 SPLASH_ARGS=""
 _ANNOUNCE=0
 _DROPPED=""
@@ -98,7 +98,7 @@ while [ "$_I" -lt "$_N" ]; do
             effort)
                 case "$_A" in
                     0) _EFFORT="none" ;;
-                    -1) : ;;  # unlimited = the model default
+                    -1) _EFFORT="" ;;  # unlimited = the engine's model default (no flag)
                     *)
                         if [ "$_A" -le 512 ] 2>/dev/null; then _EFFORT="low"
                         elif [ "$_A" -le 2048 ] 2>/dev/null; then _EFFORT="medium"
@@ -153,7 +153,11 @@ echo "  Engine:  $SPLASH"
 [ "${BONSAI_LANGUAGE_ONLY:-0}" = "1" ] \
     || echo "  Vision:  bundled with the model repo (images accepted)"
 echo "  Context: $CTX tokens (override with BONSAI_CTX, 0 = auto)"
-[ -n "$_EFFORT" ] && echo "  Thinking: default reasoning effort '$_EFFORT'"
+if [ -n "$_EFFORT" ]; then
+    echo "  Thinking: default reasoning effort '$_EFFORT'"
+else
+    echo "  Thinking: engine model default (no reasoning effort flag)"
+fi
 echo ""
 echo "  Open http://localhost:$PORT in your browser to chat."
 echo "  API:  http://localhost:$PORT/v1/chat/completions"

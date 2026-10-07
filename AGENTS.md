@@ -89,7 +89,9 @@ DFlash2 draft. The old `BONSAI_SPECULATIVE` switch is gone with the fork.
   `/status` (JSON: `maximum_context_tokens`, memory plan, KV info).
 - **Thinking control** — per request `reasoning_effort`
   (`none`/`low`/`medium`/`high`/`max`); server default via
-  `--default-reasoning-effort`. The old `thinking_budget_tokens` field is
+  `--default-reasoning-effort`, and the launcher supplies `low` whenever no
+  reasoning flag is passed (the old `--reasoning-budget -1` opts back into the
+  engine's model default). The old `thinking_budget_tokens` field is
   tolerated but ignored; unknown fields do not error.
 - **MCP tools** are configured in the *client* (agent, IDE, app). The server
   serves a model, not MCP — there is nothing to seed server-side.

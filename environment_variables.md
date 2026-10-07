@@ -42,7 +42,7 @@ a value cannot execute anything.
 
 **Extra arguments** to `start_llama_server.sh` behave the same way:
 
-- **Translated:** `-c` / `--ctx-size` → `--max-context`; `--alias` → `--served-model-name` + `--announce-served-name`; `--model`/`-m` → the served model id; `--image-max-tokens N` → `--max-image-pixels N*1024`; `--reasoning-budget` → `--default-reasoning-effort` (`0` → `none`, `≤512` → `low`, `≤2048` → `medium`, `≤8192` → `high`, else `max`); `--chat-template-kwargs '{"enable_thinking": false}'` → `--default-reasoning-effort none`.
+- **Translated:** `-c` / `--ctx-size` → `--max-context`; `--alias` → `--served-model-name` + `--announce-served-name`; `--model`/`-m` → the served model id; `--image-max-tokens N` → `--max-image-pixels N*1024`; `--reasoning-budget` → `--default-reasoning-effort` (`0` → `none`, `≤512` → `low`, `≤2048` → `medium`, `≤8192` → `high`, else `max`); `--reasoning-budget -1` → engine model default. If no reasoning flag is supplied, the launcher defaults thinking to `--default-reasoning-effort low`; `--chat-template-kwargs '{"enable_thinking": false}'` → `--default-reasoning-effort none`.
 - **Ignored with a note:** `--jinja`, `-fa`, `-ngl`, `--temp/--top-p/--top-k/--min-p`, `--spec-type`, `--spec-draft-n-max`, `--parallel`/`-np`, `--mmproj`, `--cache-type-k/-v`, `--kv-mean-center`, `--cache-reuse`, `-ub`, `--reasoning-format`, `--webui-config-file`, `-v`, …
 - **Passed through:** anything else is handed to `splash serve` verbatim (its own flags work here; a typo makes Splash print its usage).
 
