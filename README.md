@@ -1,5 +1,19 @@
 # Bonsai 2 27B on Apple Silicon
 
+> [!IMPORTANT]
+> **▶️ Live demo — the web UI at real speed.**
+> Screen recording of the built-in chat page generating at **1× speed (no
+> time-lapse)** on a **Mac mini M6, 24 GB** — what you see is exactly the
+> speed you get on comparable hardware.
+
+<div align="center">
+  <video src="x1-speed-bonsai2-splash-demo.mp4" width="100%" autoplay loop muted playsinline controls preload="metadata">
+    Demo: the Bonsai 2 web UI generating at 1× speed on a Mac mini M6 (24 GB).
+  </video>
+  <br>
+  <sub><i>The built-in chat page at <code>localhost:8080</code> — generation shown at 1× speed, Mac mini M6 · 24 GB</i></sub>
+</div>
+
 A ready-to-run demo for serving **Bonsai 2 27B** — a ternary-weight model with
 vision, native tool calling and reasoning — on an Apple Silicon Mac, as an
 OpenAI-compatible local API with a built-in chat page.
@@ -27,7 +41,7 @@ projector) into Splash's cache. Later starts load in about 4 seconds.
 - **An Ollama-compatible bridge** on port 11434, so existing Ollama clients and
   tooling work unchanged.
 - **Reasoning ("thinking")** streamed separately as `reasoning_content`, with
-  per-request control via `reasoning_effort`.
+  per-request control via `reasoning_effort` (server default: `low`).
 - **Vision** — images and PDFs, with a token cap you control.
 - **Native tool calling** — OpenAI `tool_calls` with full round-trips.
 - **A launchd service** that starts everything at login and releases all model
