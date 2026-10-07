@@ -7,9 +7,7 @@
 > speed you get on comparable hardware.
 
 <div align="center">
-  <video src="x1-speed-bonsai2-splash-demo.mp4" width="100%" autoplay loop muted playsinline controls preload="metadata">
-    Demo: the Bonsai 2 web UI generating at 1× speed on a Mac mini M6 (24 GB).
-  </video>
+  <img src="demo-autoplay.webp" alt="Demo: the Bonsai 2 web UI generating at 1× speed on a Mac mini M6 (24 GB)" width="100%">
   <br>
   <sub><i>The built-in chat page at <code>localhost:8080</code> — generation shown at 1× speed, Mac mini M6 · 24 GB</i></sub>
 </div>
