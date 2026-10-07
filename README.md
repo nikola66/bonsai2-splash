@@ -1,5 +1,9 @@
 # Bonsai 2 27B on Apple Silicon
 
+<div align="center">
+  <img src="hero.webp" alt="Bonsai 2 27B on Apple Silicon — Splash engine" width="100%">
+</div>
+
 > [!IMPORTANT]
 > **▶️ Live demo — the web UI at real speed.**
 > Screen recording of the built-in chat page generating at **1× speed (no
