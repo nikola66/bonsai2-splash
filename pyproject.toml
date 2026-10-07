@@ -1,0 +1,14 @@
+[project]
+name = "bonsai-demo"
+version = "0.1.0"
+description = "Serve Bonsai 2 27B on Apple Silicon as an OpenAI-compatible local API"
+requires-python = ">=3.9"
+# The only runtime dependency in this repo, and only for ollama_bridge.py (the
+# Ollama-API bridge); the Splash engine ships its own Python runtime via Homebrew.
+# scripts/benchmark.py is standard library only.
+dependencies = [
+    "httpx>=0.27",
+]
+
+[tool.setuptools]
+packages = []

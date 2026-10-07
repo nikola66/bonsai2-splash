@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[codz]
+*$py.class
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environments / tooling
+.venv/
+env/
+venv/
+.pdm-python
+.pdm-build/
+
+# Local config and state — each machine picks its own
+.env
+.envrc
+.bonsai-ctx
+bonsai.env
+
+# Runtime output: logs and ad-hoc benchmark runs are machine-specific
+logs/
+*.log
+reports/
+
+# Credentials — never commit
+.prism_hf_token
+.bonsai_token
+.brave_key
+.webui_secret_key
+secrets.toml
+
+# macOS
+.DS_Store
+
+# Archives
+*.tar.gz
+*.zip
+
+# Internal working notes
+TODOS.md
