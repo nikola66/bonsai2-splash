@@ -1,5 +1,5 @@
 # Endpoint test log — coding-agent (OpenCode) point of view
-Tested: 2026-10-07 · Endpoint: `http://100.72.32.0:8080/v1` · Model: `bonsai-2-27b` (Splash, M6 24 GB)
+Tested: 2026-10-07 · Endpoint: `http://<tailscale-ip>:8080/v1` · Model: `bonsai-2-27b` (Splash, M6 24 GB)
 Scripts: `agent_endpoint_test.py`, `agent_endpoint_followup.py`, `agent_endpoint_probe3.py` (30 checks total, 3 real defects found)
 
 **Status: all 3 defects FIXED (2026-10-08) — see "Retest" at the bottom.**
@@ -13,9 +13,9 @@ loopback `PORT+1` (`BONSAI_ENGINE_PORT`).
 
 ### 1. BLOCKER — endpoint not reachable at `127.0.0.1:8080` — **FIXED**
 - `connect to 127.0.0.1 port 8080 ... Connection refused`; `lsof` shows the server listening on
-  **`100.72.32.0:8080` only** (Tailscale-style address). `./bonsai.sh status` confirms `bind: 100.72.32.0 present`.
+  **`<tailscale-ip>:8080` only** (Tailscale-style address). `./bonsai.sh status` confirms `bind: <tailscale-ip> present`.
 - **Fix:** either bind `127.0.0.1` too (launchd plist / Splash `--host 127.0.0.1`, or add loopback),
-  or use `http://100.72.32.0:8080/v1` in the OpenCode provider config. As given, the URL in the task does not work.
+  or use `http://<tailscale-ip>:8080/v1` in the OpenCode provider config. As given, the URL in the task does not work.
 - **Resolved:** the engine (a single-address HTTP server) now binds `127.0.0.1:$BONSAI_ENGINE_PORT`
   (8081) only; `openai_proxy.py` owns `$PORT` (8080) and binds **both** `BONSAI_HOST` and
   `127.0.0.1` (with a 30 s rebind-retry when the VPN address is missing). The engine is no
@@ -82,7 +82,7 @@ loopback `PORT+1` (`BONSAI_ENGINE_PORT`).
 
 Service restarted on the new architecture:
 launcher → `server.server` (loopback `127.0.0.1:8081`) + `openai_proxy.py`
-(`127.0.0.1:8080` + `100.72.32.0:8080`); bridge on both addresses at 11434.
+(`127.0.0.1:8080` + `<tailscale-ip>:8080`); bridge on both addresses at 11434.
 
 | Suite | Checks | Result |
 |---|---|---|
@@ -91,7 +91,7 @@ launcher → `server.server` (loopback `127.0.0.1:8081`) + `openai_proxy.py`
 | `scripts/test_endpoint_probe3.py` | 9 | 0 failed |
 
 Defect regressions now asserted on every run:
-- **#1** `127.0.0.1:8080/health` → 200, bind address → 200, engine `100.72.32.0:8081` → refused.
+- **#1** `127.0.0.1:8080/health` → 200, bind address → 200, engine `<tailscale-ip>:8081` → refused.
 - **#2** `max_tokens=10` → `content` is `str` (`''`), never `None`, `finish=length`, no `tool_calls`.
 - **#3** missing `model` → exactly `400` with `invalid_request_error`; chat page carries the
   injected `model:"bonsai-2-27b"` field.

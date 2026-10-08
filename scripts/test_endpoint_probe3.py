@@ -2,11 +2,12 @@
 """Final probes: OpenCode-specific request shapes + proxy regression checks.
 
 BASE defaults to http://127.0.0.1:8080/v1; override with BONSAI_TEST_BASE.
+HOST defaults to 127.0.0.1; override with BONSAI_TEST_HOST for a VPN/LAN address.
 """
 import json, os, time, urllib.request, urllib.error
 
 BASE = os.environ.get("BONSAI_TEST_BASE", "http://127.0.0.1:8080/v1").rstrip("/")
-HOST = os.environ.get("BONSAI_TEST_HOST", "100.72.32.0")
+HOST = os.environ.get("BONSAI_TEST_HOST", "127.0.0.1")
 results = []
 def log(s, ok, d=""):
     line = f"[{'PASS' if ok else 'FAIL'}] {s}: {d}"

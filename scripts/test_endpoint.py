@@ -12,6 +12,8 @@ loopback reachability, `content` never null on finish=length, and a missing
 stdlib only (urllib) so it runs anywhere.
 
     BASE defaults to http://127.0.0.1:8080/v1; override with BONSAI_TEST_BASE.
+    HOST (the non-loopback bind address to probe) defaults to 127.0.0.1;
+    override with BONSAI_TEST_HOST to check a VPN/LAN address.
 """
 import json
 import os
@@ -21,7 +23,8 @@ import urllib.request
 import urllib.error
 
 BASE = os.environ.get("BONSAI_TEST_BASE", "http://127.0.0.1:8080/v1").rstrip("/")
-HOST = os.environ.get("BONSAI_TEST_HOST", "100.72.32.0")
+HOST = os.environ.get("BONSAI_TEST_HOST", "127.0.0.1")
+LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
 MODEL = "bonsai-2-27b"
 
 errors = []
@@ -86,9 +89,15 @@ loop_code = get_code("http://127.0.0.1:8080/health")
 log("bind: 127.0.0.1:8080/health", loop_code == 200, f"status={loop_code}")
 bind_code = get_code(f"http://{HOST}:8080/health")
 log(f"bind: {HOST}:8080/health", bind_code == 200, f"status={bind_code}")
-engine_net = get_code("http://100.72.32.0:8081/health")
-log("bind: engine port not network-reachable", engine_net is None,
-    f"100.72.32.0:8081 -> {engine_net} (expect refused/None)")
+if HOST in LOOPBACK_HOSTS:
+    # The engine binds loopback on purpose, so probing it here would always
+    # answer 200. Only a non-loopback HOST proves it isn't network-reachable.
+    log("bind: engine port not network-reachable", True,
+        f"skipped (HOST={HOST} is loopback; set BONSAI_TEST_HOST to probe)")
+else:
+    engine_net = get_code(f"http://{HOST}:8081/health")
+    log("bind: engine port not network-reachable", engine_net is None,
+        f"{HOST}:8081 -> {engine_net} (expect refused/None)")
 
 # ---------------------------------------------------------------- 1. plain chat
 print("\n=== 1. Plain chat (agent quick prompt) ===")
