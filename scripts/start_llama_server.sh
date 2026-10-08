@@ -19,16 +19,21 @@ cd "$(resolve_demo_dir)"
 # values already in the environment take precedence.
 DEMO_DIR="$(resolve_demo_dir)"
 if [ -f "$DEMO_DIR/bonsai.env" ]; then
-    _keep_host="${BONSAI_HOST:-}"; _keep_port="${PORT:-}"
+    _keep_host="${BONSAI_HOST:-}"; _keep_port="${PORT:-}"; _keep_eport="${BONSAI_ENGINE_PORT:-}"
     . "$DEMO_DIR/bonsai.env"
     [ -n "$_keep_host" ] && BONSAI_HOST="$_keep_host"
     [ -n "$_keep_port" ] && PORT="$_keep_port"
+    [ -n "$_keep_eport" ] && BONSAI_ENGINE_PORT="$_keep_eport"
 fi
 
 # Bind to loopback by default; override with BONSAI_HOST=0.0.0.0 for LAN/remote.
 # There is no authentication, so the bind address is the access control.
+# openai_proxy.py owns $PORT and always serves loopback next to $HOST (the
+# engine binds one address only); the engine itself takes the next port on
+# loopback. Override with BONSAI_ENGINE_PORT if that port is taken.
 HOST="${BONSAI_HOST:-127.0.0.1}"
 PORT="${PORT:-8080}"
+ENGINE_PORT="${BONSAI_ENGINE_PORT:-$((PORT + 1))}"
 
 # ── Find the Splash binary (launchd's PATH may miss Homebrew) ──
 SPLASH="$(splash_bin)"
@@ -38,13 +43,42 @@ if [ -z "$SPLASH" ]; then
     exit 1
 fi
 
-# ── Check the port is free ──
+# ── Python for openai_proxy.py (stdlib only; the venv is what the bridge uses) ──
+PROXY_PY=""
+for _c in "$DEMO_DIR/.venv/bin/python3" "$DEMO_DIR/.venv/bin/python" \
+          "$(command -v python3 2>/dev/null || true)" /usr/bin/python3; do
+    if [ -n "$_c" ] && [ -x "$_c" ]; then PROXY_PY="$_c"; break; fi
+done
+if [ -z "$PROXY_PY" ]; then
+    err "python3 not found (openai_proxy.py needs it)."
+    exit 1
+fi
+
+# ── Check the ports are free ──
 _CHECK_HOST="$HOST"
 [ "$_CHECK_HOST" = "0.0.0.0" ] && _CHECK_HOST="127.0.0.1"
 if curl -s --max-time 2 "http://$_CHECK_HOST:$PORT/health" >/dev/null 2>&1; then
     warn "A server is already running on port $PORT."
     echo "  Stop it first with:  kill \$(lsof -ti TCP:$PORT)"
     exit 1
+fi
+if curl -s --max-time 2 "http://127.0.0.1:$ENGINE_PORT/health" >/dev/null 2>&1; then
+    warn "A Bonsai engine is already running on port $ENGINE_PORT."
+    echo "  Stop it first with:  kill \$(lsof -ti TCP:$ENGINE_PORT)"
+    exit 1
+fi
+
+# ── Host names the engine must accept in the Host header ──
+# The engine binds loopback (the proxy owns the public port) and validates
+# every request's Host against its bind address plus --allowed-host, so it
+# needs the public addresses clients will type. `--allowed-host` is repeatable.
+ALLOWED_HOST_ARGS=""
+if [ "$HOST" = "0.0.0.0" ]; then
+    for _ip in $(ifconfig 2>/dev/null | awk '/inet /{print $2}' | grep -Ev '^127\.'); do
+        ALLOWED_HOST_ARGS="$ALLOWED_HOST_ARGS --allowed-host $_ip"
+    done
+elif [ "$HOST" != "127.0.0.1" ] && [ "$HOST" != "localhost" ]; then
+    ALLOWED_HOST_ARGS="--allowed-host $HOST"
 fi
 
 # ── Base configuration (env-driven, same knobs as before) ──
@@ -161,42 +195,77 @@ fi
 echo ""
 echo "  Open http://localhost:$PORT in your browser to chat."
 echo "  API:  http://localhost:$PORT/v1/chat/completions"
+echo "  Engine: 127.0.0.1:$ENGINE_PORT (internal, proxied on $HOST:$PORT)"
 echo "  Press Ctrl+C to stop."
 echo ""
 
 # Run Splash as a child process — NOT exec. launchd (bootout) and the terminal
 # (Ctrl+C) signal THIS script; the trap stops the whole engine tree. A plain
 # SIGTERM to the `splash serve` wrapper alone would orphan the `server.server`
-# HTTP process that holds the port (Splash spawns it; it spawns serve-native).
+# HTTP process that holds the engine port (Splash spawns it; it spawns
+# serve-native). The engine binds loopback only: openai_proxy.py owns $PORT,
+# so every client — localhost, VPN, the chat page — goes through it.
 # shellcheck disable=SC2086
 "$SPLASH" serve \
     --model "$MODEL" \
-    --host "$HOST" \
-    --port "$PORT" \
+    --host 127.0.0.1 \
+    --port "$ENGINE_PORT" \
     --max-context "$CTX" \
     ${_IMG:+--max-image-pixels $_IMG} \
     ${_EFFORT:+--default-reasoning-effort $_EFFORT} \
     --idle-release "$_IDLE" \
     $SPLASH_ARGS \
+    $ALLOWED_HOST_ARGS \
     "$@" &
 CLI=$!
 
-_stop_tree() {
-    trap - TERM INT
-    # server.server with our host/port = this instance's HTTP server; its
-    # graceful shutdown also stops the serve-native engine child (the weights).
-    pkill -TERM -f "server\.server .*--host[= ]${HOST}.*--port[= ]${PORT}" 2>/dev/null || :
-    pkill -TERM -f "server\.server .*--port[= ]${PORT}.*--host[= ]${HOST}" 2>/dev/null || :
+# The OpenAI-normalizing proxy (loopback + BONSAI_HOST -> engine loopback).
+BONSAI_HOST="$HOST" PORT="$PORT" BONSAI_ENGINE_PORT="$ENGINE_PORT" \
+    "$PROXY_PY" "$DEMO_DIR/openai_proxy.py" &
+PROXY=$!
+sleep 1
+if ! kill -0 "$PROXY" 2>/dev/null; then
+    err "openai_proxy.py failed to start (port $PORT in use?)."
+    echo "  See the log above; check with:  lsof -nP -iTCP:$PORT -sTCP:LISTEN"
     kill -TERM "$CLI" 2>/dev/null || :
     wait "$CLI" 2>/dev/null || :
+    exit 1
+fi
+
+_reap() {
+    # server.server with our engine port = this instance's HTTP server; its
+    # graceful shutdown also stops the serve-native engine child (the weights).
+    pkill -TERM -f "server\.server .*--port[= ]${ENGINE_PORT}([^0-9]|$)" 2>/dev/null || :
+    kill -TERM "$PROXY" 2>/dev/null || :
+}
+
+_stop_tree() {
+    trap - TERM INT
+    _reap
+    kill -TERM "$CLI" 2>/dev/null || :
+    wait "$CLI" 2>/dev/null || :
+    wait "$PROXY" 2>/dev/null || :
     exit 0
 }
 trap '_stop_tree' TERM INT
 
+# Watch both children: whichever exits first ends the service, so launchd's
+# KeepAlive brings the pair back (a dead proxy would otherwise leave the
+# engine up with nothing serving the public port).
 _RC=0
-wait "$CLI" || _RC=$?
-# The wrapper exited on its own (crash or external kill): make sure no HTTP
-# server for this instance outlives it holding the port.
-pkill -TERM -f "server\.server .*--host[= ]${HOST}.*--port[= ]${PORT}" 2>/dev/null || :
-pkill -TERM -f "server\.server .*--port[= ]${PORT}.*--host[= ]${HOST}" 2>/dev/null || :
+while :; do
+    kill -0 "$CLI" 2>/dev/null || break
+    if ! kill -0 "$PROXY" 2>/dev/null; then _RC=3; break; fi
+    sleep 1
+done
+if [ "$_RC" = 0 ]; then
+    wait "$CLI" || _RC=$?
+else
+    kill -TERM "$CLI" 2>/dev/null || :
+fi
+# The wrapper exited on its own (crash, external kill, context restart): make
+# sure neither the engine nor the proxy outlives it holding a port.
+_reap
+wait "$CLI" 2>/dev/null || :
+wait "$PROXY" 2>/dev/null || :
 exit "$_RC"

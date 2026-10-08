@@ -114,12 +114,17 @@ DFlash2 draft. The old `BONSAI_SPECULATIVE` switch is gone with the fork.
 - **Memory** — the running stack costs ~11 GB of pressure (engine RSS ~3.3 GB,
   since weights are file-backed); `./bonsai.sh stop` frees all of it (measured:
   18.0 GB free stopped vs 5.0 GB free running).
-- **Process tree** — launcher (traps TERM/INT) → `server.server` (holds the port;
+- **Process tree** — launcher (traps TERM/INT) → two children: `server.server`
+  (the Splash engine; binds loopback `BONSAI_ENGINE_PORT`, default `PORT+1`;
   SIGTERM to it stops the whole tree, verified) → `serve-native` (holds the
-  weights). The bridge's context restart works by SIGTERM-ing `server.server`;
-  launchd's KeepAlive brings it back (~12–14 s) with the `.bonsai-ctx` value. A
-  stray SIGTERM to the `splash serve` wrapper alone used to orphan the server —
-  the launcher's trap prevents that.
+  weights), and `openai_proxy.py` (owns the public `PORT`, binds `BONSAI_HOST`
+  **and** `127.0.0.1` — loopback is always served). The proxy normalizes
+  `content: null` → `""` (no `tool_calls`), enforces `model` with a 400, and
+  injects the model id into the bundled chat page's request. The bridge's
+  context restart SIGTERM-s `server.server` by its engine-port pattern (never
+  the proxy); launchd's KeepAlive brings the pair back (~12–14 s) with the
+  `.bonsai-ctx` value. A stray SIGTERM to the `splash serve` wrapper alone used
+  to orphan the server — the launcher's trap prevents that.
 - **Context changes restart the server** (weights reload). Expected, and the same
   as before.
 - **No embeddings endpoint** — Splash's `/v1/embeddings` returns 404 and the
@@ -151,6 +156,11 @@ curl -s http://localhost:8080/v1/chat/completions \
 
 # full report (writes reports/benchmark-<timestamp>.{md,json})
 python3 scripts/benchmark.py --base-url http://localhost:8080
+
+# endpoint regression suites (43 checks; BONSAI_TEST_BASE to point elsewhere)
+python3 scripts/test_endpoint.py
+python3 scripts/test_endpoint_followup.py
+python3 scripts/test_endpoint_probe3.py
 ```
 
 Tool calling: send an OpenAI `tools` array and expect

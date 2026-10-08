@@ -25,11 +25,11 @@ import os
 import re
 import signal
 import subprocess
+import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
 
 import httpx
 
@@ -62,6 +62,11 @@ def _setting(key: str, default: str) -> str:
 HOST = _setting("BRIDGE_HOST", _setting("BONSAI_HOST", "127.0.0.1"))
 PORT = int(_setting("BRIDGE_PORT", "11434"))
 UPSTREAM = _setting("BRIDGE_UPSTREAM", f"http://{HOST}:{_setting('PORT', '8080')}").rstrip("/")
+# The Splash engine itself: openai_proxy.py owns UPSTREAM's port and forwards
+# to the engine on loopback ENGINE_PORT (default PORT + 1). Context restarts
+# signal this process, never the proxy. Keep in sync with start_llama_server.sh.
+_EPORT = _setting("BONSAI_ENGINE_PORT", "")
+ENGINE_PORT = int(_EPORT) if _EPORT else int(_setting("PORT", "8080")) + 1
 OLLAMA_VERSION = os.environ.get("BRIDGE_OLLAMA_VERSION", "0.5.13")
 GGUF_DIR = DEMO_DIR / "models" / "bonsai2-gguf" / "27B"
 TIMEOUT = httpx.Timeout(600.0, connect=10.0)
@@ -216,24 +221,17 @@ def healthy() -> bool:
 
 def _splash_pids() -> list:
     """PIDs of the Splash HTTP server (`python -m server.server ...`) this
-    bridge translates to: matched on its cmdline carrying the same --host and
-    --port as UPSTREAM, so a context restart never signals an unrelated Splash
-    instance. SIGTERM to this process stops the whole engine tree (it owns the
-    serve-native child that holds the weights); the `splash serve` wrapper does
-    NOT forward signals to it."""
-    up = urlparse(UPSTREAM)
-    host = re.escape(up.hostname or "")
-    port = up.port or (443 if up.scheme == "https" else 80)
-    # Arg order in the cmdline differs (`--port 8080 --host=IP`); accept both.
-    # Splash also omits --host entirely when it is the default (127.0.0.1),
-    # so only require the host when upstream points somewhere else.
-    if (up.hostname or "") in ("127.0.0.1", "localhost"):
-        pat = rf"server\.server .*--port[= ]{port}"
-    else:
-        pat = (
-            rf"server\.server .*--host[= ]{host}.*--port[= ]{port}"
-            rf"|server\.server .*--port[= ]{port}.*--host[= ]{host}"
-        )
+    bridge translates to: matched on its cmdline carrying the engine port
+    (loopback, BONSAI_ENGINE_PORT / PORT + 1 — the public port belongs to
+    openai_proxy.py, so a context restart never signals it or an unrelated
+    Splash instance). SIGTERM to this process stops the whole engine tree (it
+    owns the serve-native child that holds the weights); the `splash serve`
+    wrapper does NOT forward signals to it."""
+    # Splash omits --host from the cmdline when it is the default (it always
+    # is now: the engine binds loopback), so match on the port only. Arg order
+    # varies, so require a non-digit after the port (`--port 8081` must not
+    # match `--port 80810`).
+    pat = rf"server\.server .*--port[= ]{ENGINE_PORT}([^0-9]|$)"
     try:
         out = subprocess.run(
             ["pgrep", "-f", pat],
@@ -788,6 +786,18 @@ def main():
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     server.daemon_threads = True
     print(f"ollama bridge listening on http://{HOST}:{PORT} -> {UPSTREAM}", flush=True)
+    # Loopback is always served too — same rule as openai_proxy.py: standard
+    # Ollama clients default to localhost:11434, and exposing a VPN/LAN address
+    # must not break them. Not needed when the primary socket already covers
+    # loopback (127.0.0.1 / localhost / 0.0.0.0 / ::).
+    if HOST not in ("127.0.0.1", "localhost", "0.0.0.0", "::"):
+        try:
+            alt = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+            alt.daemon_threads = True
+            threading.Thread(target=alt.serve_forever, daemon=True).start()
+            print(f"ollama bridge also listening on http://127.0.0.1:{PORT}", flush=True)
+        except OSError as e:
+            print(f"WARNING: cannot bind loopback:{PORT} for the bridge: {e}", flush=True)
     server.serve_forever()
 
 

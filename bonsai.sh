@@ -25,10 +25,12 @@ DEMO_ENV="$DEMO_DIR/bonsai.env"
 if [ -f "$DEMO_ENV" ]; then
     # Values from the environment take precedence, so only set what is unset.
     _keep_host="${BONSAI_HOST:-}"; _keep_port="${PORT:-}"; _keep_bport="${BRIDGE_PORT:-}"
+    _keep_eport="${BONSAI_ENGINE_PORT:-}"
     . "$DEMO_ENV"
     [ -n "$_keep_host" ] && BONSAI_HOST="$_keep_host"
     [ -n "$_keep_port" ] && PORT="$_keep_port"
     [ -n "$_keep_bport" ] && BRIDGE_PORT="$_keep_bport"
+    [ -n "$_keep_eport" ] && BONSAI_ENGINE_PORT="$_keep_eport"
 fi
 
 # Bind address the service uses. Loopback unless overridden, so an unauthenticated
@@ -37,24 +39,23 @@ fi
 HOST="${BONSAI_HOST:-127.0.0.1}"
 PORT="${PORT:-8080}"
 BRIDGE_PORT="${BRIDGE_PORT:-11434}"
+# The engine itself binds loopback on the next port; openai_proxy.py owns $PORT
+# and serves loopback next to $HOST. Keep in sync with start_llama_server.sh.
+ENGINE_PORT="${BONSAI_ENGINE_PORT:-$((PORT + 1))}"
 # A VPN/Tailscale address is a real interface, not 0.0.0.0, so it can be bound
 # directly and health-checked directly.
 CHECK_HOST="$HOST"
 [ "$CHECK_HOST" = "0.0.0.0" ] && CHECK_HOST="127.0.0.1"
 
 # The engine's HTTP server process for THIS service (see start_llama_server.sh):
-# `python -m server.server ... --port 8080 --host=<HOST>`. It owns the port and
-# the serve-native child that holds the model weights. Matching on the host and
-# port keeps us from touching an unrelated Splash instance.
-# Splash omits --host from the child's cmdline when it is the default
-# (127.0.0.1), so only require it when we asked for something else. Arg order
-# also varies (`--port 8080 --host=IP`), so accept both.
-_HOST_RE="$(printf '%s' "$HOST" | sed 's/\./\\./g')"
-if [ "$HOST" = "127.0.0.1" ] || [ "$HOST" = "localhost" ]; then
-    SRV_PAT="server\.server .*--port[= ]${PORT}"
-else
-    SRV_PAT="server\.server .*--host[= ]${_HOST_RE}.*--port[= ]${PORT}|server\.server .*--port[= ]${PORT}.*--host[= ]${_HOST_RE}"
-fi
+# `python -m server.server ... --port <ENGINE_PORT>`. It owns the serve-native
+# child that holds the model weights; the public port belongs to the proxy, so
+# matching on the engine port keeps us from touching an unrelated Splash
+# instance. Splash omits --host from the child's cmdline when it is the default
+# (it always is now: the engine binds loopback), so do not match on the host.
+# Arg order varies, so require a non-digit after the port (`--port 8081` must
+# not match `--port 80810`).
+SRV_PAT="server\.server .*--port[= ]${ENGINE_PORT}([^0-9]|$)"
 
 loaded() { launchctl print "gui/$U/$1" >/dev/null 2>&1; }
 
@@ -83,8 +84,8 @@ case "${1:-status}" in
             if [ "$HOST" = "127.0.0.1" ]; then
                 echo "NOTE: loopback not listed by ifconfig; starting anyway."
             else
-                echo "WARNING: bind address $HOST not found - the service binds that"
-                echo "         address and will keep retrying until it exists."
+                echo "WARNING: bind address $HOST not found - the proxy will keep"
+                echo "         retrying until it exists; loopback still serves."
                 echo "         (For Tailscale: connect it, then re-run.)"
             fi
         fi
@@ -106,7 +107,12 @@ case "${1:-status}" in
         echo "Stopping (releases all model memory):"
         stop_one "$SERVER"
         stop_one "$BRIDGE"
-        sleep 1
+        # bootout TERMs the launcher, whose trap TERMs the engine; the engine's
+        # graceful shutdown (it owns the serve-native weights child) takes a few
+        # seconds. Wait for the tree to actually exit before reporting.
+        i=0; while [ $i -lt 15 ] && pgrep -f "$SRV_PAT" >/dev/null 2>&1; do
+            sleep 1; i=$((i+1))
+        done
         if pgrep -f "$SRV_PAT" >/dev/null 2>&1; then
             echo "WARNING: splash serve still running:"; pgrep -fl "$SRV_PAT"
         else
@@ -154,12 +160,14 @@ case "${1:-status}" in
         else
             echo "splash serve: not running (0 GB - memory free)"
         fi
-        if [ "$HOST" = "127.0.0.1" ]; then
+        if [ "$HOST" = "127.0.0.1" ] || [ "$HOST" = "localhost" ]; then
             echo "bind: loopback only (set BONSAI_HOST to expose on a LAN/VPN address)"
+        elif [ "$HOST" = "0.0.0.0" ]; then
+            echo "bind: all interfaces + loopback (engine on 127.0.0.1:$ENGINE_PORT)"
         elif interface_has_host; then
-            echo "bind: $HOST present"
+            echo "bind: $HOST + loopback (engine on 127.0.0.1:$ENGINE_PORT)"
         else
-            echo "bind: $HOST MISSING (service cannot bind)"
+            echo "bind: $HOST MISSING (proxy retries; loopback still serves on 127.0.0.1:$PORT)"
         fi
         ;;
     *)

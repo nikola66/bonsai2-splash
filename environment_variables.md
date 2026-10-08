@@ -22,8 +22,9 @@ a value cannot execute anything.
 | `BONSAI_MODEL` | `27B` | `27B` | Model size. Splash serves 27B only. |
 | `BONSAI_SPLASH_MODEL` | `prism-ml/Ternary-Bonsai-2-27B-gguf:PQ2_0` | `OWNER/REPO[:VARIANT]` | The Hugging Face model Splash serves; it downloads the weights, paired DFlash2 draft and vision projector into its own cache on first run. Example alternative: `unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M`. |
 | **Network** | | | |
-| `BONSAI_HOST` | `127.0.0.1` | any bind address | Bind address (Splash `--host`); `0.0.0.0` = all interfaces. Also read by `bonsai.sh` (health checks) and by the bridge (its default `BRIDGE_HOST`). There is no auth on the server, so the bind address is the access control — keep it on loopback, or use a mesh-VPN address. |
-| `PORT` | `8080` | port | HTTP port (Splash `--port`). |
+| `BONSAI_HOST` | `127.0.0.1` | any bind address | Bind address of the public proxy (`openai_proxy.py`); `0.0.0.0` = all interfaces. **Loopback is always served too** — the proxy binds this address *and* `127.0.0.1`, and retries a missing address every 30 s while loopback serves. Also read by `bonsai.sh` (health checks) and by the bridge (its default `BRIDGE_HOST`). There is no auth on the server, so the bind address is the access control — keep it on loopback, or use a mesh-VPN address. |
+| `PORT` | `8080` | port | Public HTTP port (the proxy's). |
+| `BONSAI_ENGINE_PORT` | `PORT + 1` | port | Internal loopback port of the Splash engine; it never listens on the network. Override only if `PORT + 1` is already taken. Keep in sync across `start_llama_server.sh`, `bonsai.sh` and `ollama_bridge.py` (they read the same value). |
 | `BRIDGE_PORT` | `11434` | port | Ollama bridge port. The official Ollama app binds `127.0.0.1:11434`, so there is no clash by default. |
 | **Memory / context** | | | |
 | `BONSAI_CTX` | auto (RAM-tiered 8K–128K) | `0`, or ≤ `262144` | Context window, passed as `--max-context`. `0`/unset = RAM-tiered default (8192 → 131072 by machine memory; never emitted as 0). An explicit number forces it (e.g. `262144` for the full training context). The launchd service defaults to `65536` and additionally reads `.bonsai-ctx` (written by the web UI's context slider) when `BONSAI_CTX` is unset. |
@@ -50,9 +51,9 @@ a value cannot execute anything.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `BRIDGE_HOST` | `BONSAI_HOST`, else `127.0.0.1` | Bridge bind address. Falls back to the server's bind address so both are reachable from the same place. No auth — keep it on loopback or behind an authenticating network. |
+| `BRIDGE_HOST` | `BONSAI_HOST`, else `127.0.0.1` | Bridge bind address. Falls back to the server's bind address so both are reachable from the same place; loopback is always served as well (same rule as the proxy). No auth — keep it on loopback or behind an authenticating network. |
 | `BRIDGE_PORT` | `11434` | Bind port. |
-| `BRIDGE_UPSTREAM` | `http://<bind>:<PORT>` | The Splash server the bridge translates to (also used to find the engine's PID for context restarts). |
+| `BRIDGE_UPSTREAM` | `http://<bind>:<PORT>` | The public server the bridge translates to (the proxy, not the engine directly). |
 | `BRIDGE_OLLAMA_VERSION` | `0.5.13` | Version reported by `GET /api/version`. |
 | `BRIDGE_KV_BYTES_PER_TOKEN` | `32768` | Display constant for the web UI's KV memory estimate (`int8` KV ≈ 32 KiB/token). |
 

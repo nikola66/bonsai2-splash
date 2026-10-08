@@ -118,8 +118,9 @@ The knobs you are most likely to want, all optional:
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `BONSAI_HOST` | `127.0.0.1` | Bind address. `0.0.0.0` = all interfaces. |
-| `PORT` | `8080` | HTTP port. |
+| `BONSAI_HOST` | `127.0.0.1` | Bind address. `0.0.0.0` = all interfaces. Loopback is always served too — `openai_proxy.py` binds both, so exposing a VPN address never breaks `localhost`. |
+| `PORT` | `8080` | HTTP port (the proxy's; the engine itself binds loopback `PORT+1`). |
+| `BONSAI_ENGINE_PORT` | `PORT+1` | Internal loopback port of the Splash engine. Override only if `PORT+1` is taken. |
 | `BONSAI_CTX` | RAM-tiered, 8K–128K | Context window (max 262144). |
 | `BONSAI_SPLASH_MODEL` | `prism-ml/Ternary-Bonsai-2-27B-gguf:PQ2_0` | Which model to serve. |
 | `BONSAI_IMAGE_MAX_TOKENS` | `1024` | Vision tokens per image; `0` = uncapped (4096). |
@@ -168,6 +169,13 @@ with a long context, `BONSAI_MAX_CACHE_DISK=16G` lets blocks spill to SSD.
 **The server and the bridge have no authentication.** The bind address is the
 only access control, so they default to loopback.
 
+Exposing is additive: `openai_proxy.py` (and the bridge) bind `BONSAI_HOST`
+*and* `127.0.0.1`, so `http://127.0.0.1:8080/v1` keeps working whenever a
+VPN/LAN address is configured — and if that address does not exist yet (VPN
+down), the proxy retries every 30 s while loopback serves in the meantime.
+The Splash engine never listens on the network: it stays on
+`127.0.0.1:PORT+1` behind the proxy.
+
 To reach them from your own devices, the sensible option is a mesh VPN such as
 Tailscale — bind to its address and the network becomes the perimeter:
 
@@ -214,8 +222,9 @@ object before blaming the hardware: thinking tokens dominate "slow answers", so
 cap them with `reasoning_effort` or the chat page's effort picker.
 
 **Service starts but is unreachable** — if you bound to a VPN address, the
-interface must exist first; the agent retries until it does. `./bonsai.sh status`
-and `logs/bonsai-server.err.log` show what happened.
+interface must exist first; the proxy retries every 30 s until it does, and
+loopback keeps serving in the meantime. `./bonsai.sh status` and
+`logs/bonsai-server.err.log` show what happened.
 
 **Something needs embeddings** — Splash does not serve them: `/v1/embeddings`
 returns 404, and the bridge's `/api/embed` returns 501 with
@@ -229,16 +238,22 @@ bonsai.sh                start / stop / status / install    ← the entry point
 install-service.sh       generate launchd agents for this checkout
 bonsai-service.sh        service environment + flags
 bonsai.env               your bind address and ports (copy from the example)
+openai_proxy.py          public-port proxy: loopback always served, model
+                         enforced, content never null (normalizes the engine)
 ollama_bridge.py         Ollama API → OpenAI translation
 scripts/
-  start_llama_server.sh  server launcher (translates flags, then runs splash serve)
+  start_llama_server.sh  server launcher: splash serve (loopback engine) +
+                         openai_proxy.py on the public port
   common.sh              shared launcher logic
   benchmark.py           measure a running server and emit a report
+  test_endpoint*.py      endpoint regression suites (43 checks)
 ```
 
 Flow: `bonsai.sh` → `bonsai-service.sh` → `scripts/start_llama_server.sh` →
-`splash serve`. The bridge sits beside the server and translates Ollama requests
-to its OpenAI API. Any Splash-native flag can be passed through:
+`splash serve` (engine on `127.0.0.1:PORT+1`) + `openai_proxy.py` (public
+`PORT`: `BONSAI_HOST` + loopback). The bridge sits beside the server and
+translates Ollama requests to its OpenAI API. Any Splash-native flag can be
+passed through:
 
 ```bash
 ./scripts/start_llama_server.sh --max-memory 20G --language-only
