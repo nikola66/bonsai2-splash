@@ -74,7 +74,9 @@ def _setting(key: str, default: str) -> str:
 HOST = _setting("BONSAI_HOST", "127.0.0.1")
 PORT = int(_setting("PORT", "8080"))
 ENGINE_PORT = int(_setting("BONSAI_ENGINE_PORT", str(PORT + 1)))
+BRIDGE_PORT = int(_setting("BRIDGE_PORT", "11434"))
 ENGINE = ("127.0.0.1", ENGINE_PORT)
+BRIDGE = ("127.0.0.1", BRIDGE_PORT)
 
 # OpenAI requires `model` on its text routes; the engine accepts these
 # requests without one (only its Anthropic route validates the field).
@@ -262,7 +264,262 @@ def _patch_page(data: bytes, mid: str) -> bytes:
         + json.dumps(mid).encode()
         + b", messages:"
     )
-    return data.replace(PAGE_PATTERN, repl)
+    data = data.replace(PAGE_PATTERN, repl)
+    return _inject_controls(data)
+
+
+# ── sidebar controls injected into the Splash chat page ───────────────────
+# The chat page is served by the engine, so extra controls (temperature,
+# top-p, system prompt, context slider) are added here by the proxy. A fetch
+# wrapper injects the sampling fields + system message client-side, which keeps
+# working even if the engine's inline request code changes shape.
+CONTROLS_HTML = """
+  <div class="recent-label">Settings</div>
+  <div id="bonsai-controls">
+    <label class="ctl"><span>Temperature <b id="temperature-val"></b></span>
+      <input id="temperature" type="range" min="0" max="2" step="0.05">
+    </label>
+    <label class="ctl"><span>Top-p <b id="top-p-val"></b></span>
+      <input id="top-p" type="range" min="0" max="1" step="0.01">
+    </label>
+    <button id="sampling-reset" type="button">Reset sampling</button>
+    <label class="ctl"><span>System prompt</span>
+      <textarea id="system-prompt" rows="3" placeholder="Optional system prompt" spellcheck="false"></textarea>
+      <input id="system-prompt-name" type="text" placeholder="Name to save as…" autocomplete="off" spellcheck="false" aria-label="Saved prompt name">
+      <div class="sysrow">
+        <select id="system-prompt-list" aria-label="Saved system prompts"></select>
+        <button id="system-prompt-save" type="button" title="Save current text">Save</button>
+        <button id="system-prompt-delete" type="button" title="Delete selected">Del</button>
+      </div>
+    </label>
+    <label class="ctl"><span>Context <b id="ctx-val"></b></span>
+      <input id="ctx-slider" type="range" min="8192" max="262144" step="4096">
+    </label>
+    <div id="ctx-note"></div>
+    <button id="ctx-apply" type="button">Apply context (restarts)</button>
+  </div>"""
+
+CONTROLS_CSS = """
+  #bonsai-controls { display: grid; gap: 10px; padding: 2px 10px; font-size: 13px }
+  #bonsai-controls .ctl { display: grid; gap: 5px; color: var(--muted) }
+  #bonsai-controls .ctl span { display: flex; justify-content: space-between; font-size: 12px; font-weight: 600 }
+  #bonsai-controls .ctl b { color: var(--text); font-weight: 600 }
+  #bonsai-controls input[type=range] { width: 100%; accent-color: var(--text) }
+  #bonsai-controls textarea { min-height: 56px; max-height: 160px; padding: 7px 8px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); resize: vertical }
+  #bonsai-controls button { padding: 6px 8px; border: 1px solid var(--border); border-radius: 8px; color: var(--text); background: var(--bg); font-size: 12px; text-align: left }
+  #bonsai-controls button:hover { background: var(--hover) }
+  #bonsai-controls button:disabled { opacity: .45 }
+  #bonsai-controls select, #bonsai-controls input[type=text] { width: 100%; padding: 6px 8px; color: var(--text); background: var(--bg); border: 1px solid var(--border); border-radius: 8px; font-size: 12px }
+  #bonsai-controls .sysrow { display: flex; gap: 6px }
+  #bonsai-controls .sysrow select { min-width: 0; flex: 1 }
+  #bonsai-controls .sysrow button { flex: none }
+  #ctx-note { color: var(--muted); font-size: 11px; line-height: 1.4 }
+"""
+
+CONTROLS_JS = """
+<script>
+(function () {
+  // Runs after the engine page script: wrap fetch so sampling + system prompt
+  // apply no matter how the page builds its request body.
+  const tempKey = 'splash-temperature', topPKey = 'splash-top-p', sysKey = 'splash-system-prompt';
+  const sysLibKey = 'splash-system-prompts';
+  const sysLibMax = 50;
+  const store = {
+    get(k) { try { return localStorage.getItem(k); } catch { return null; } },
+    set(k, v) { try { localStorage.setItem(k, v); } catch {} },
+    del(k) { try { localStorage.removeItem(k); } catch {} }
+  };
+  const origFetch = window.fetch.bind(window);
+  window.fetch = function (url, init) {
+    try {
+      const target = typeof url === 'string' ? url : url?.url || '';
+      if (typeof target === 'string' && target.includes('/v1/chat/completions') &&
+          (init?.method || 'GET').toUpperCase() === 'POST' && typeof init?.body === 'string') {
+        const payload = JSON.parse(init.body);
+        if (payload && typeof payload === 'object' && Array.isArray(payload.messages)) {
+          const t = parseFloat(store.get(tempKey)), p = parseFloat(store.get(topPKey));
+          if (Number.isFinite(t)) payload.temperature = Math.min(2, Math.max(0, t));
+          if (Number.isFinite(p)) payload.top_p = Math.min(1, Math.max(0, p));
+          const sys = (store.get(sysKey) || '').trim();
+          if (sys && payload.messages[0]?.role !== 'system')
+            payload.messages = [{role: 'system', content: sys}, ...payload.messages];
+          init = {...init, body: JSON.stringify(payload)};
+          if (typeof url === 'string') return origFetch(url, init);
+          return origFetch(new Request(url, init), undefined);
+        }
+      }
+    } catch { /* fall through with the original request */ }
+    return origFetch(url, init);
+  };
+
+  function bindRange(id, valId, key, fmt, def) {
+    const el = document.getElementById(id), val = document.getElementById(valId);
+    if (!el || !val) return null;
+    const render = () => { val.textContent = el.value === '' ? 'default' : fmt(parseFloat(el.value)); };
+    const saved = parseFloat(store.get(key));
+    if (Number.isFinite(saved)) el.value = String(saved); else { el.value = String(def); el.dataset.auto = '1'; }
+    render();
+    el.addEventListener('input', () => {
+      if (el.dataset.auto && parseFloat(el.value) === def) { store.del(key); }
+      else { delete el.dataset.auto; store.set(key, el.value); }
+      render();
+    });
+    return {el, reset() { delete el.dataset.auto; el.value = String(def); el.dataset.auto = '1'; store.del(key); render(); }};
+  }
+  const tCtl = bindRange('temperature', 'temperature-val', tempKey, v => v.toFixed(2), 1);
+  const pCtl = bindRange('top-p', 'top-p-val', topPKey, v => v.toFixed(2), 1);
+  document.getElementById('sampling-reset')?.addEventListener('click', () => { tCtl?.reset(); pCtl?.reset(); });
+
+  const sysEl = document.getElementById('system-prompt');
+  const sysName = document.getElementById('system-prompt-name');
+  const sysList = document.getElementById('system-prompt-list');
+  const sysSave = document.getElementById('system-prompt-save');
+  const sysDel = document.getElementById('system-prompt-delete');
+  function sysLibLoad() {
+    try {
+      const raw = JSON.parse(store.get(sysLibKey));
+      if (!Array.isArray(raw)) return [];
+      const seen = new Set(), out = [];
+      for (const e of raw) {
+        if (!e || typeof e.text !== 'string' || !e.text.trim()) continue;
+        const name = typeof e.name === 'string' && e.name.trim() ? e.name.trim().slice(0, 60) : e.text.trim().replace(/\s+/g, ' ').slice(0, 34);
+        const id = typeof e.id === 'string' ? e.id : null;
+        if (id && seen.has(id)) continue;
+        if (id) seen.add(id);
+        out.push({id: id || ('sp' + Math.random().toString(36).slice(2, 10)), name, text: e.text, updated: Number(e.updated) || 0});
+      }
+      out.sort((a, b) => b.updated - a.updated);
+      return out.slice(0, sysLibMax);
+    } catch { return []; }
+  }
+  function sysLibStore(lib) {
+    try { localStorage.setItem(sysLibKey, JSON.stringify(lib.slice(0, sysLibMax))); return true; }
+    catch { return false; }
+  }
+  function sysTitleFor(text) {
+    const t = text.replace(/\s+/g, ' ').trim();
+    return t.length > 34 ? t.slice(0, 34) + '…' : t;
+  }
+  function sysRender(lib, selectId) {
+    if (!sysList) return;
+    sysList.replaceChildren();
+    const ph = document.createElement('option');
+    ph.value = '';
+    ph.textContent = lib.length ? 'Load saved…' : 'No saved prompts';
+    sysList.append(ph);
+    for (const e of lib) {
+      const o = document.createElement('option');
+      o.value = e.id;
+      o.textContent = e.name;
+      o.title = e.text.slice(0, 200);
+      sysList.append(o);
+    }
+    if (selectId) sysList.value = selectId;
+  }
+  function sysApplyText(text) {
+    if (!sysEl) return;
+    sysEl.value = text;
+    if (text.trim()) store.set(sysKey, sysEl.value); else store.del(sysKey);
+  }
+  if (sysEl) {
+    sysEl.value = store.get(sysKey) || '';
+    let deb;
+    sysEl.addEventListener('input', () => {
+      clearTimeout(deb);
+      deb = setTimeout(() => {
+        const v = sysEl.value.trim();
+        if (v) store.set(sysKey, sysEl.value); else store.del(sysKey);
+      }, 250);
+    });
+    let lib = sysLibLoad();
+    sysRender(lib);
+    sysList?.addEventListener('change', () => {
+      const e = lib.find(x => x.id === sysList.value);
+      if (!e) return;
+      sysApplyText(e.text);
+      if (sysName) sysName.value = e.name;
+    });
+    sysSave?.addEventListener('click', () => {
+      const text = (sysEl.value || '').trim();
+      if (!text) return;
+      lib = sysLibLoad();
+      const name = (sysName?.value || '').trim().slice(0, 60) || sysTitleFor(text);
+      const dup = lib.findIndex(x => x.text === text);
+      const entry = {id: dup >= 0 ? lib[dup].id : ('sp' + Date.now().toString(36)), name, text, updated: Date.now()};
+      if (dup >= 0) lib.splice(dup, 1);
+      lib.unshift(entry);
+      if (sysLibStore(lib)) { lib = sysLibLoad(); sysRender(lib, entry.id); if (sysName) sysName.value = name; }
+    });
+    sysDel?.addEventListener('click', () => {
+      if (!sysList?.value) return;
+      lib = sysLibLoad().filter(x => x.id !== sysList.value);
+      sysLibStore(lib);
+      sysRender(sysLibLoad());
+      if (sysName) sysName.value = '';
+    });
+  }
+
+  // Context slider: same origin via the proxy (/bonsai/context -> bridge).
+  const slider = document.getElementById('ctx-slider'), ctxVal = document.getElementById('ctx-val');
+  const note = document.getElementById('ctx-note'), apply = document.getElementById('ctx-apply');
+  let serverCtx = null;
+  const fmtCtx = n => Number(n).toLocaleString();
+  const paint = () => { if (ctxVal && slider) ctxVal.textContent = fmtCtx(slider.value); };
+  async function refreshCtx() {
+    try {
+      const r = await origFetch('/bonsai/context');
+      if (!r.ok) throw 0;
+      const j = await r.json();
+      serverCtx = j.n_ctx || j.file_n_ctx || null;
+      if (serverCtx && slider) { slider.value = String(serverCtx); paint(); }
+      if (note) note.textContent = serverCtx ? `Server: ${fmtCtx(serverCtx)} tokens. Applying restarts the server (~12s).` : '';
+    } catch { if (note) note.textContent = 'Context status unavailable.'; }
+  }
+  slider?.addEventListener('input', () => {
+    paint();
+    if (note && serverCtx && Number(slider.value) !== serverCtx)
+      note.textContent = `Will restart with ${fmtCtx(slider.value)} tokens (now ${fmtCtx(serverCtx)}).`;
+    else if (note && serverCtx) note.textContent = `Server: ${fmtCtx(serverCtx)} tokens.`;
+  });
+  apply?.addEventListener('click', async () => {
+    if (!slider) return;
+    apply.disabled = true;
+    try {
+      const r = await origFetch('/bonsai/context', {method: 'POST',
+        headers: {'Content-Type': 'application/json'}, body: JSON.stringify({n_ctx: Number(slider.value)})});
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(j.error?.message || r.statusText);
+      serverCtx = Number(slider.value);
+      if (note) note.textContent = `Restarting with ${fmtCtx(serverCtx)} tokens — wait ~12s, then retry.`;
+    } catch (e) { if (note) note.textContent = 'Apply failed: ' + (e.message || e); }
+    finally { apply.disabled = false; }
+  });
+  refreshCtx();
+})();
+</script>"""
+
+
+def _inject_controls(data: bytes) -> bytes:
+    """Insert the sidebar settings block, its CSS and its wiring script."""
+    if b'id="bonsai-controls"' in data:
+        return data  # already injected (or engine adopted it)
+    if b'<nav id="recents"' in data:
+        data = data.replace(
+            b'<nav id="recents" aria-label="Recent chats"></nav>',
+            b'<nav id="recents" aria-label="Recent chats"></nav>' + CONTROLS_HTML.encode(),
+            1,
+        )
+    elif b"</aside>" in data:
+        data = data.replace(b"</aside>", CONTROLS_HTML.encode() + b"</aside>", 1)
+    else:
+        return data
+    if b"</style>" in data:
+        data = data.replace(b"</style>", CONTROLS_CSS.encode() + b"</style>", 1)
+    if b"</body>" in data:
+        data = data.replace(b"</body>", CONTROLS_JS.encode() + b"</body>", 1)
+    else:
+        data = data + CONTROLS_JS.encode()
+    return data
 
 
 def _normalize_chat(data: bytes) -> bytes:
@@ -327,6 +584,44 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self._send(status, body, [("Content-Type", "application/json")])
 
     # ── chat page: inject the served model id so it satisfies the API ───────
+    def _relay_bridge(self, body: bytes | None, t0: float) -> None:
+        """Forward /bonsai/context to the Ollama bridge verbatim."""
+        conn: HTTPConnection | None = None
+        try:
+            fwd = {
+                k: v for k, v in self.headers.items()
+                if k.lower() not in HOP_BY_HOP and k.lower() != "host"
+            }
+            fwd["Connection"] = "close"
+            conn = HTTPConnection(BRIDGE[0], BRIDGE[1], timeout=30.0)
+            try:
+                conn.request(self.command, self.path, body=body, headers=fwd)
+                resp = conn.getresponse()
+            except (OSError, HTTPException) as exc:
+                self._send_json(
+                    502, _error_body(f"context bridge unavailable: {exc}", "api_error"))
+                self._log_line("/bonsai/context", 502, t0, "bridge unavailable")
+                return
+            data = resp.read()
+            headers = [(k, v) for k, v in resp.headers.items()
+                       if k.lower() not in ("connection", "keep-alive",
+                                            "transfer-encoding", "content-length")]
+            self.send_response_only(resp.status, resp.reason)
+            for key, value in headers:
+                self.send_header(key, value)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            self._log_line("/bonsai/context", resp.status, t0)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+
     def _maybe_patch_page(self, data: bytes, ctype: str) -> bytes:
         if "text/html" not in ctype or PAGE_PATTERN not in data:
             return data
@@ -369,6 +664,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     keep_alive=False,
                 )
                 self._log_line(path, 413, t0, "body too large")
+                return
+
+            # Same-origin context control for the sidebar slider: forward to the
+            # Ollama bridge (which owns .bonsai-ctx and the restart), same as
+            # a direct http://...:11434/bonsai/context call.
+            if path == "/bonsai/context":
+                self._relay_bridge(body, t0)
                 return
 
             # Parse the body only where the proxy gates or normalizes it.
