@@ -7,8 +7,8 @@ API response carries a `timings` object, so measure on the user's own hardware
 before promising performance.
 
 Engine reference: [README.md](README.md). Variable reference:
-[environment_variables.md](environment_variables.md). Measured results:
-[BENCHMARKS.md](BENCHMARKS.md).
+[environment_variables.md](environment_variables.md). Client configs:
+[CLIENTS.md](CLIENTS.md). Measured results: [BENCHMARKS.md](BENCHMARKS.md).
 
 **This demo runs on the [Splash](https://github.com/incoai/splash) engine**
 (`brew install incoai/tap/splash`), replacing an earlier custom llama.cpp fork.
@@ -51,7 +51,7 @@ All extra args pass through the start script, e.g.
 
 | Knob | What it does | Trade-off |
 |---|---|---|
-| `BONSAI_CTX=N` | Forces `--max-context N` (≤ 262144). Unset = RAM-tiered default (32768 on a 24 GB machine); the launchd service also reads `.bonsai-ctx` (chat-page slider, 8192–262144, default 65536). | More context = more KV memory. At `int8` KV ≈ 32 KiB/token, so 64K ≈ 2 GB and the machine's plan allows ~188K total. Pair very long contexts with `BONSAI_MAX_CACHE_DISK` on tight machines. |
+| `BONSAI_CTX=N` | Forces `--max-context N` (≤ 262144). Unset = RAM-tiered default (65536 on a 24 GB machine); the launchd service also reads `.bonsai-ctx` (chat-page slider, 8192–262144, default 65536). | More context = more KV memory. At `int8` KV ≈ 32 KiB/token, so 64K ≈ 2 GB and the machine's plan allows ~188K total. Pair very long contexts with `BONSAI_MAX_CACHE_DISK` on tight machines. |
 | `BONSAI_IMAGE_MAX_TOKENS=N` | Vision tokens per image → `--max-image-pixels N*1024`. Default **1024**; `0` = uncapped (Splash's 4096 tokens / 4.2 MP). | **Ask the user** (below). |
 | `BONSAI_IDLE_RELEASE=off\|30s\|10m…` | Splash frees model memory after N idle; the next request restores it from disk in seconds. Default `off` (stays resident). | On 24 GB, `10m` returns ~11 GB when idle but the first message after idle pays a reload. Good for machines that are off most of the day. |
 | `BONSAI_MAX_MEMORY=size` | Caps Splash's working-set budget (`--max-memory 20G`). | Default: Splash derives it from free memory at start. |
@@ -157,10 +157,11 @@ curl -s http://localhost:8080/v1/chat/completions \
 # full report (writes reports/benchmark-<timestamp>.{md,json})
 python3 scripts/benchmark.py --base-url http://localhost:8080
 
-# endpoint regression suites (43 checks; BONSAI_TEST_BASE to point elsewhere)
+# endpoint regression suites (59 checks; BONSAI_TEST_BASE to point elsewhere)
 python3 scripts/test_endpoint.py
 python3 scripts/test_endpoint_followup.py
 python3 scripts/test_endpoint_probe3.py
+python3 scripts/test_endpoint_clients.py
 ```
 
 Tool calling: send an OpenAI `tools` array and expect

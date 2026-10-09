@@ -20,10 +20,20 @@ behaviour the engine itself does not implement:
     which crashes clients that do message.content.strip(). The proxy answers
     "" instead (null stays legitimate when tool_calls are present, as OpenAI
     defines).
+  * **Path tolerance.** Clients are routinely given a base URL without the
+    `/v1` suffix or with a trailing slash. The proxy canonicalizes both, so
+    `/chat/completions`, `/v1/chat/completions`, `/v1/chat/completions/` and
+    `/models/<id>` all reach the same engine route.
+  * **CORS.** Browser-based OpenAI clients get permissive CORS headers and a
+    proper preflight answer, so a web UI on another origin can talk to a
+    loopback server with no proxy setup.
+  * **Honest unsupported routes.** OpenAI routes Splash does not implement
+    (embeddings, audio, images, files, batches, moderations) are answered with
+    a clear 501 instead of the engine's bare 404 "not found".
 
 Everything else passes through byte-for-byte: the chat page, /v1/models,
 /health, /ready, /status, SSE streams (including tool-call deltas), uploads,
-error bodies, CORS and API-key headers.
+error bodies and API-key headers.
 
 Config (same precedence as ollama_bridge.py: environment wins over the
 git-ignored bonsai.env, which wins over defaults):
@@ -85,6 +95,54 @@ MODEL_REQUIRED = {"/v1/chat/completions", "/v1/completions", "/v1/responses"}
 # The bundled chat page's request body (server/chat.html) — the one client
 # that legitimately posts without a model field.
 PAGE_PATTERN = b"body: JSON.stringify({messages:"
+
+# Path aliases. Clients are often pointed at a base URL without the /v1 suffix
+# (or hand it one with a trailing slash); OpenAI's own SDK appends the route to
+# the base. Serving the routes with and without the prefix costs nothing and
+# removes a whole class of "404 from a custom endpoint" reports.
+PATH_ALIASES = {
+    "/chat/completions": "/v1/chat/completions",
+    "/completions": "/v1/completions",
+    "/responses": "/v1/responses",
+    "/models": "/v1/models",
+    "/embeddings": "/v1/embeddings",
+}
+MODELS_PREFIX = "/models/"
+
+# Methods each canonical route accepts. A wrong method is a 405 with an Allow
+# header, which client logs read correctly, instead of the engine's 404.
+ROUTE_METHODS = {
+    "/v1/chat/completions": {"POST"},
+    "/v1/completions": {"POST"},
+    "/v1/responses": {"POST"},
+    "/v1/embeddings": {"POST"},
+    "/v1/models": {"GET", "HEAD"},
+}
+
+# OpenAI routes the Splash engine does not implement. The engine answers a bare
+# 404, which clients log as a routing bug; the proxy turns that into an explicit
+# 501 (only when the engine 404s, so a future engine addition is not shadowed).
+UNSUPPORTED_ROUTES = {
+    "/v1/embeddings": "embeddings",
+    "/v1/audio/transcriptions": "audio transcription",
+    "/v1/audio/speech": "speech synthesis",
+    "/v1/images/generations": "image generation",
+    "/v1/moderations": "moderation",
+    "/v1/files": "file management",
+    "/v1/batches": "batch jobs",
+}
+
+# Permissive CORS for browser-based OpenAI clients. The server has no auth and
+# defaults to loopback, so reflecting the requesting origin is safe here and
+# works with the Authorization header (which `*` would also allow, but
+# reflecting keeps credentialed fetches working too).
+CORS_ALLOW_METHODS = "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS"
+CORS_ALLOW_HEADERS = (
+    "Authorization, Content-Type, Accept, Origin, User-Agent, "
+    "X-Requested-With, X-Client-Request-Id, OpenAI-Beta, x-api-key, "
+    "anthropic-version"
+)
+CORS_MAX_AGE = "86400"
 
 # Headers that describe a single hop and are re-framed by this proxy.
 # Expect is dropped because the proxy already answers 100-continue itself;
@@ -193,9 +251,33 @@ def _read_body(handler) -> bytes | None:
 
 
 def _error_body(message: str, err_type: str = "invalid_request_error") -> bytes:
+    """OpenAI's error envelope, `param` included (clients read it as null)."""
     return json.dumps(
-        {"error": {"message": message, "type": err_type, "code": err_type}}
+        {
+            "error": {
+                "message": message,
+                "type": err_type,
+                "param": None,
+                "code": err_type,
+            }
+        }
     ).encode()
+
+
+def _canonical_path(path: str) -> str:
+    """Map a request path to the engine's canonical route.
+
+    Strips a trailing slash (except root) and adds the `/v1` prefix to the few
+    OpenAI routes clients often reach without it. Query strings are handled by
+    the caller; this sees only the path.
+    """
+    if path != "/":
+        path = path.rstrip("/") or "/"
+    if path in PATH_ALIASES:
+        return PATH_ALIASES[path]
+    if path.startswith(MODELS_PREFIX) and len(path) > len(MODELS_PREFIX):
+        return "/v1" + path
+    return path
 
 
 def _engine_get(path: str, timeout: float = 10.0) -> tuple[int | None, bytes | None]:
@@ -562,16 +644,44 @@ class ProxyHandler(BaseHTTPRequestHandler):
     def log_error(self, fmt, *args):
         _log(f"request error: {fmt % args if args else fmt}")
 
+    def _cors_headers(self, preflight: bool = False) -> list[tuple[str, str]]:
+        """CORS headers for the current request.
+
+        Reflects the requesting origin (so credentialed fetches and the
+        Authorization header work) and adds `Vary: Origin`. A request without
+        an Origin gets no CORS headers unless it is a preflight.
+        """
+        origin = self.headers.get("Origin")
+        if not origin:
+            if not preflight:
+                return []
+            origin = "*"
+        headers = [
+            ("Access-Control-Allow-Origin", origin),
+            ("Vary", "Origin"),
+        ]
+        if preflight:
+            req_headers = self.headers.get("Access-Control-Request-Headers")
+            headers += [
+                ("Access-Control-Allow-Methods", CORS_ALLOW_METHODS),
+                ("Access-Control-Allow-Headers", req_headers or CORS_ALLOW_HEADERS),
+                ("Access-Control-Max-Age", CORS_MAX_AGE),
+            ]
+        return headers
+
     def _send(
         self,
         status: int,
         body: bytes,
         headers: list[tuple[str, str]] | None = None,
         keep_alive: bool = True,
+        preflight: bool = False,
     ) -> None:
         self._started = True
         self.send_response_only(status)
         for key, value in headers or ():
+            self.send_header(key, value)
+        for key, value in self._cors_headers(preflight=preflight):
             self.send_header(key, value)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
@@ -580,8 +690,17 @@ class ProxyHandler(BaseHTTPRequestHandler):
         if not keep_alive:
             self.close_connection = True
 
-    def _send_json(self, status: int, body: bytes) -> None:
-        self._send(status, body, [("Content-Type", "application/json")])
+    def _send_json(
+        self,
+        status: int,
+        body: bytes,
+        headers: list[tuple[str, str]] | None = None,
+    ) -> None:
+        self._send(
+            status,
+            body,
+            [("Content-Type", "application/json")] + list(headers or ()),
+        )
 
     # ── chat page: inject the served model id so it satisfies the API ───────
     def _relay_bridge(self, body: bytes | None, t0: float) -> None:
@@ -590,7 +709,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
         try:
             fwd = {
                 k: v for k, v in self.headers.items()
-                if k.lower() not in HOP_BY_HOP and k.lower() != "host"
+                if k.lower() not in HOP_BY_HOP
+                and k.lower() not in ("host", "origin")
             }
             fwd["Connection"] = "close"
             conn = HTTPConnection(BRIDGE[0], BRIDGE[1], timeout=30.0)
@@ -608,6 +728,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
                                             "transfer-encoding", "content-length")]
             self.send_response_only(resp.status, resp.reason)
             for key, value in headers:
+                self.send_header(key, value)
+            for key, value in self._cors_headers():
                 self.send_header(key, value)
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
@@ -645,7 +767,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
         conn: HTTPConnection | None = None
         t0 = time.monotonic()
         method = self.command
-        path = urlsplit(self.path).path
+        split = urlsplit(self.path)
+        path = _canonical_path(split.path)
+        # Preserve the query string when the path was rewritten.
+        forward_target = path + (f"?{split.query}" if split.query else "")
         try:
             try:
                 body = _read_body(self)
@@ -664,6 +789,34 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     keep_alive=False,
                 )
                 self._log_line(path, 413, t0, "body too large")
+                return
+
+            # CORS preflight is answered here: the engine sends no CORS headers,
+            # and a browser client on another origin needs them before it will
+            # send the real request.
+            if method == "OPTIONS":
+                self._send(204, b"", preflight=True)
+                self._log_line(path, 204, t0, "cors preflight")
+                return
+
+            # Wrong method on a known route -> 405 with Allow. The engine would
+            # answer 404, which client logs misread as a bad URL.
+            if path in ROUTE_METHODS and method not in ROUTE_METHODS[path]:
+                allowed = ", ".join(sorted(ROUTE_METHODS[path] | {"OPTIONS"}))
+                self._send_json(
+                    405,
+                    _error_body(f"method {method} not allowed on {path}"),
+                    [("Allow", allowed)],
+                )
+                self._log_line(path, 405, t0, "method not allowed")
+                return
+            if path.startswith("/v1/models/") and method not in ("GET", "HEAD"):
+                self._send_json(
+                    405,
+                    _error_body(f"method {method} not allowed on {path}"),
+                    [("Allow", "GET, HEAD, OPTIONS")],
+                )
+                self._log_line(path, 405, t0, "method not allowed")
                 return
 
             # Same-origin context control for the sidebar slider: forward to the
@@ -700,10 +853,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
             # Headers, re-framed for one hop; the client's Host is forwarded
             # verbatim (the engine validates it) and Accept-Encoding is
-            # dropped so bodies arrive identity-coded.
+            # dropped so bodies arrive identity-coded. Origin is dropped too:
+            # the engine rejects any Origin not passed to --allowed-origin with
+            # a 403, and the proxy is the one answering CORS.
             fwd: dict[str, str] = {}
             for key, value in self.headers.items():
-                if key.lower() in HOP_BY_HOP:
+                if key.lower() in HOP_BY_HOP or key.lower() == "origin":
                     continue
                 fwd[key] = value
             if stream:
@@ -713,7 +868,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
             conn = HTTPConnection(ENGINE[0], ENGINE[1], timeout=ENGINE_TIMEOUT)
             try:
-                conn.request(method, self.path, body=body, headers=fwd)
+                conn.request(method, forward_target, body=body, headers=fwd)
                 resp = conn.getresponse()
             except (OSError, HTTPException) as exc:
                 self._send_json(
@@ -738,6 +893,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     if key.lower() in ("connection", "keep-alive"):
                         continue
                     self.send_header(key, value)
+                for key, value in self._cors_headers():
+                    self.send_header(key, value)
                 self.end_headers()
                 self.close_connection = True
                 self._log_line(path, resp.status, t0)
@@ -746,6 +903,20 @@ class ProxyHandler(BaseHTTPRequestHandler):
             data = resp.read()
             ctype = resp.getheader("Content-Type", "")
             encoded = resp.getheader("Content-Encoding")
+
+            # A known-unimplemented OpenAI route: the engine's bare 404 reads
+            # as a routing bug in client logs, so answer explicitly.
+            if resp.status == 404 and path in UNSUPPORTED_ROUTES:
+                self._send_json(
+                    501,
+                    _error_body(
+                        f"{UNSUPPORTED_ROUTES[path]} is not served by the "
+                        f"Splash engine ({path})"
+                    ),
+                )
+                self._log_line(path, 501, t0, "unsupported route")
+                return
+
             if resp.status == 200 and not encoded:
                 if "text/html" in ctype:
                     data = self._maybe_patch_page(data, ctype)
@@ -761,6 +932,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
             ]
             self.send_response_only(resp.status, resp.reason)
             for key, value in headers:
+                self.send_header(key, value)
+            for key, value in self._cors_headers():
                 self.send_header(key, value)
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
@@ -795,6 +968,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
         for key, value in resp.headers.items():
             if key.lower() in ("connection", "keep-alive"):
                 continue
+            self.send_header(key, value)
+        for key, value in self._cors_headers():
             self.send_header(key, value)
         self.send_header("Connection", "close")
         self.end_headers()

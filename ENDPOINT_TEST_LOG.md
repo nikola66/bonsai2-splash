@@ -7,7 +7,9 @@ Scripts moved to `scripts/test_endpoint.py`, `scripts/test_endpoint_followup.py`
 `scripts/test_endpoint_probe3.py` (43 checks total, `BONSAI_TEST_BASE` overridable,
 default `http://127.0.0.1:8080/v1`). The fix lives in `openai_proxy.py`: a
 normalization proxy that owns the public `PORT` while the Splash engine binds
-loopback `PORT+1` (`BONSAI_ENGINE_PORT`).
+loopback `PORT+1` (`BONSAI_ENGINE_PORT`). A fourth suite,
+`scripts/test_endpoint_clients.py` (16 checks), was added on 2026-10-09 for
+client compatibility — see the bottom of this file (59 checks total).
 
 ## Errors to fix
 
@@ -102,3 +104,48 @@ prefix cache through the proxy (`cache_n=46176`, repeat 0.4 s), bridge
 `/api/tags` + `/api/chat` on loopback **and** the VPN address, and a full
 `/bonsai/context` restart cycle (SIGTERM matched the new engine-port pattern;
 new tree came back with `--max-context=65536`, both addresses healthy).
+
+---
+
+## Client-compatibility pass — 2026-10-09 · **59/59 PASS**
+
+Goal: make the OpenAI endpoints work out of the box for the clients the demo
+targets (Hermes, OpenClaw, VS Code, OpenCode, generic OpenAI SDKs), not only for
+OpenCode. Changes in `openai_proxy.py`:
+
+- **Path tolerance** — `/chat/completions`, `/v1/chat/completions` and
+  `/v1/chat/completions/` (plus `/models`, `/models/<id>`, trailing slashes)
+  all reach the same engine route. Query strings are preserved.
+- **CORS** — `OPTIONS` preflight is answered (204 + Allow-Origin/Methods/
+  Headers/Max-Age) and the requesting origin is reflected on every response,
+  including SSE streams.
+- **Engine `Origin` guard** — the Splash engine 403s any request carrying an
+  `Origin` it was not started with (`... restart the server with
+  --allowed-origin ...`). The proxy now **strips `Origin` before forwarding**
+  and answers CORS itself, so browser clients work.
+- **Wrong method** — `GET /v1/chat/completions` now returns `405` with an
+  `Allow` header instead of the engine's 404.
+- **Unimplemented routes** — a known set (`/v1/embeddings`, audio, images,
+  files, batches, moderations) is translated from the engine's bare 404 into a
+  clear **501** naming the route.
+- **Error envelope** — `error.param` is now present (`null`), matching the
+  OpenAI shape clients parse.
+
+`scripts/common.sh` also raises the 24 GB context tier from 32768 to **65536**,
+so 64K-minimum clients (Hermes) work without configuration. Documented in
+[CLIENTS.md](CLIENTS.md).
+
+| Suite | Checks | Result |
+|---|---|---|
+| `scripts/test_endpoint.py` | 23 | 0 failed |
+| `scripts/test_endpoint_followup.py` | 11 | 0 failed |
+| `scripts/test_endpoint_probe3.py` | 9 | 0 failed |
+| `scripts/test_endpoint_clients.py` (new) | 16 | 0 failed |
+| **Total** | **59** | **0 failed** |
+
+The new suite asserts: base URL with/without `/v1`, trailing slashes, models
+shape (`object=list`, `context_length≥64000`, `vision`), `/v1/models/<id>`,
+CORS preflight + reflected headers + the Origin 403 guard, the error envelope
+(`param`), 405 with `Allow`, 501 for `/v1/embeddings`, `max_completion_tokens`,
+`response_format: json_schema`, `stream_options.include_usage`, and a
+`/v1/responses` round-trip.

@@ -97,6 +97,9 @@ after moving or renaming the directory. Uninstall with `./bonsai.sh uninstall`.
 | OpenAI SDK / apps | base URL `http://localhost:8080/v1`, any API key, model `bonsai-2-27b` |
 | Ollama | host `localhost:11434`, model `bonsai-2-27b:latest` (any name resolves) |
 
+Per-client configs for **Hermes, OpenClaw, VS Code, OpenCode** and the generic
+OpenAI SDK are in **[CLIENTS.md](CLIENTS.md)**.
+
 ```bash
 curl -s http://localhost:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
@@ -121,7 +124,7 @@ The knobs you are most likely to want, all optional:
 | `BONSAI_HOST` | `127.0.0.1` | Bind address. `0.0.0.0` = all interfaces. Loopback is always served too — `openai_proxy.py` binds both, so exposing a VPN address never breaks `localhost`. |
 | `PORT` | `8080` | HTTP port (the proxy's; the engine itself binds loopback `PORT+1`). |
 | `BONSAI_ENGINE_PORT` | `PORT+1` | Internal loopback port of the Splash engine. Override only if `PORT+1` is taken. |
-| `BONSAI_CTX` | RAM-tiered, 8K–128K | Context window (max 262144). |
+| `BONSAI_CTX` | RAM-tiered, 8K–128K (64K on 24 GB) | Context window (max 262144). |
 | `BONSAI_SPLASH_MODEL` | `prism-ml/Ternary-Bonsai-2-27B-gguf:PQ2_0` | Which model to serve. |
 | `BONSAI_IMAGE_MAX_TOKENS` | `1024` | Vision tokens per image; `0` = uncapped (4096). |
 | `BONSAI_IDLE_RELEASE` | `off` | Free model memory after N idle (`30s`, `10m`, …). |
@@ -148,9 +151,10 @@ idle, at the cost of a few seconds on the first request after a long pause.
 
 ### Context window
 
-Default is RAM-tiered (32768 on a 24 GB machine); the launchd service pins
-65536, or the value in `.bonsai-ctx` written by the chat page's context slider
-(8192–262144). Force one for any run:
+Default is RAM-tiered (65536 on a 24 GB machine — chosen so agent harnesses
+that require a 64K minimum, such as Hermes, work out of the box); the launchd
+service pins 65536, or the value in `.bonsai-ctx` written by the chat page's
+context slider (8192–262144). Force one for any run:
 
 ```bash
 BONSAI_CTX=131072 ./scripts/start_llama_server.sh
@@ -246,7 +250,7 @@ scripts/
                          openai_proxy.py on the public port
   common.sh              shared launcher logic
   benchmark.py           measure a running server and emit a report
-  test_endpoint*.py      endpoint regression suites (43 checks)
+  test_endpoint*.py      endpoint regression suites (59 checks)
 ```
 
 Flow: `bonsai.sh` → `bonsai-service.sh` → `scripts/start_llama_server.sh` →
