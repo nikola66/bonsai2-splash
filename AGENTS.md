@@ -58,6 +58,7 @@ All extra args pass through the start script, e.g.
 | `BONSAI_MAX_CACHE_DISK=size` | SSD tier for KV/prefix cache blocks (`--max-cache-disk 16G`). | **Writes to disk.** Only for very long contexts on tight machines. |
 | `BONSAI_KV_FORMAT` | `int8` (default, about half the KV memory of the old FP16) or `bf16`. | bf16 = full precision, 2× KV memory, marginal quality gain at very long context. |
 | `BONSAI_LANGUAGE_ONLY=1` | Skip the vision tower entirely. | Slightly lighter and faster start; refuses image input. |
+| `BONSAI_EMBED=0` | Turn off the MLX embeddings service (`/v1/embeddings` answers 501). | Embeddings are off by default only if `mlx-vlm` is missing from `.venv`; `BONSAI_EMBED_MODEL`/`PORT`/`DIM`/`MAX_TOKENS` tune the service. |
 | `--reasoning-budget N` (legacy flag) | Mapped to `--default-reasoning-effort`: `0`→`none`, `≤512`→`low`, `≤2048`→`medium`, `≤8192`→`high`, else `max`. | Prefer `--default-reasoning-effort` or per-request `reasoning_effort`. |
 | `--max-memory`, `--kv-format`, `--idle-release`, `--offline`, … | Splash-native flags passed straight through. | `splash serve --help` is the reference; unknown flags make Splash print usage. |
 
@@ -93,6 +94,14 @@ DFlash2 draft. The old `BONSAI_SPECULATIVE` switch is gone with the fork.
   reasoning flag is passed (the old `--reasoning-budget -1` opts back into the
   engine's model default). The old `thinking_budget_tokens` field is
   tolerated but ignored; unknown fields do not error.
+- **Embeddings** — `/v1/embeddings` (OpenAI shape, `dimensions` 128/256/512 via
+  Matryoshka truncation, `encoding_format` float/base64), and the Ollama bridge's
+  `/api/embed` + legacy `/api/embeddings`. Served by a small **MLX** service
+  (`embeddings_service.py`, EmbeddingGemma 2 text-only 270M, loopback port 8082)
+  — the Splash engine has no pooling head. It starts with the launcher when
+  `mlx-vlm` is importable in `.venv`; otherwise the route answers a clear 501.
+  The embedding model is intentionally **not** listed in `/v1/models` or
+  `/api/tags` (chat clients must not select it).
 - **MCP tools** are configured in the *client* (agent, IDE, app). The server
   serves a model, not MCP — there is nothing to seed server-side.
 - **Ollama bridge** on port 11434: `/api/tags` (one entry, the
@@ -112,25 +121,34 @@ DFlash2 draft. The old `BONSAI_SPECULATIVE` switch is gone with the fork.
 - **Thinking dominates "slow answers"**, not the engine. Cap it per chat with the
   reasoning-effort picker or `reasoning_effort` before blaming hardware.
 - **Memory** — the running stack costs ~11 GB of pressure (engine RSS ~3.3 GB,
-  since weights are file-backed); `./bonsai.sh stop` frees all of it (measured:
+  since weights are file-backed) plus ~0.6 GB resident for the MLX embeddings
+  service when enabled; `./bonsai.sh stop` frees all of it (measured:
   18.0 GB free stopped vs 5.0 GB free running).
-- **Process tree** — launcher (traps TERM/INT) → two children: `server.server`
+- **Process tree** — launcher (traps TERM/INT) → two chat children: `server.server`
   (the Splash engine; binds loopback `BONSAI_ENGINE_PORT`, default `PORT+1`;
   SIGTERM to it stops the whole tree, verified) → `serve-native` (holds the
   weights), and `openai_proxy.py` (owns the public `PORT`, binds `BONSAI_HOST`
-  **and** `127.0.0.1` — loopback is always served). The proxy normalizes
+  **and** `127.0.0.1` — loopback is always served). A third child,
+  `embeddings_service.py`, binds loopback `BONSAI_EMBED_PORT` (default 8082) when
+  `mlx-vlm` is importable. The proxy forwards `/v1/embeddings` there (503 while
+  it loads, 501 when disabled) and `ollama_bridge.py` forwards `/api/embed*`.
+  The proxy normalizes
   `content: null` → `""` (no `tool_calls`), enforces `model` with a 400, and
   injects the model id into the bundled chat page's request. The bridge's
   context restart SIGTERM-s `server.server` by its engine-port pattern (never
-  the proxy); launchd's KeepAlive brings the pair back (~12–14 s) with the
+  the proxy); launchd's KeepAlive brings the children back (~12–14 s) with the
   `.bonsai-ctx` value. A stray SIGTERM to the `splash serve` wrapper alone used
   to orphan the server — the launcher's trap prevents that.
 - **Context changes restart the server** (weights reload). Expected, and the same
   as before.
-- **No embeddings endpoint** — Splash's `/v1/embeddings` returns 404 and the
-  bridge's `/api/embed` and `/api/embeddings` return 501 with
-  `embeddings are not served by the Splash engine`. The old engine had them;
-  anything relying on embeddings breaks.
+- **Embeddings live in a separate MLX process** — Splash's `/v1/embeddings`
+  returns 404 with no pooling head (the old engine had them). The demo's answer
+  is `embeddings_service.py`: EmbeddingGemma 2 (text-only 270M, ~580 MB
+  download, ~0.6 GB resident) on the Metal GPU via mlx-vlm — no llama.cpp, no
+  PyTorch. Vectors are L2-normalized; `dimensions` truncates (MRL) and
+  re-normalizes. Measured on M6 24 GB: **~4 ms** for a short query and
+  **~10.5 K tok/s** for long inputs (see BENCHMARKS.md). Requires mlx-vlm ≥ 0.7.7
+  (unreleased; pinned git commit) in `.venv`.
 - **Check macOS Low Power Mode** when speeds look far off (System Settings →
   Battery) — it throttles inference hard.
 - **Prefix cache caveat** — when benchmarking, use a unique prompt per
@@ -146,6 +164,12 @@ DFlash2 draft. The old `BONSAI_SPECULATIVE` switch is gone with the fork.
 curl -s http://localhost:8080/health
 curl -s http://localhost:8080/status | python3 -m json.tool | head -30
 curl -s http://localhost:8080/v1/models | python3 -m json.tool
+
+# embeddings (EmbeddingGemma 2 via MLX, 768-dim by default)
+curl -s http://localhost:8080/v1/embeddings \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"embeddinggemma-2-270m","input":["hello","world"],"dimensions":256}' \
+  | python3 -m json.tool | grep -E 'dimensions|"embedding"|prompt_tokens' | head -4
 
 # time any request: read the "timings" object in the response
 curl -s http://localhost:8080/v1/chat/completions \

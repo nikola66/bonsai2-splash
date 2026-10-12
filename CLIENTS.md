@@ -19,7 +19,11 @@ client insists on the full repo id.
 
 The model supports **tool calling**, **image/PDF input**, and **reasoning**
 (streamed separately as `reasoning_content`, controlled with
-`reasoning_effort`). It does **not** serve embeddings.
+`reasoning_effort`).
+
+Embeddings are served too, by a separate EmbeddingGemma 2 model — send
+`/v1/embeddings` requests with model `embeddinggemma-2-270m` (see
+[Embeddings & RAG](#embeddings--rag) below).
 
 If you exposed the server on a VPN/LAN address (see the README), the same URL
 works with that host: `http://<your-address>:8080/v1`. Loopback always works too.
@@ -183,6 +187,27 @@ so it cannot be pointed at the Bonsai server. Use the LM Studio **chat**
 
 ---
 
+## Embeddings & RAG
+
+RAG and semantic-search clients point at the **same base URL** and use the
+embedding model id `embeddinggemma-2-270m`:
+
+```bash
+curl -s http://localhost:8080/v1/embeddings -H 'Content-Type: application/json' \
+  -d '{"model":"embeddinggemma-2-270m","input":["Your document text goes here"],"dimensions":768}'
+```
+
+- Vectors are **768-dim**, L2-normalized. Ask for `dimensions` 128/256/512 and
+  the service truncates (Matryoshka) and re-normalizes — useful when your index
+  is fixed at a smaller size.
+- `encoding_format: "base64"` is supported (float is the default).
+- Ollama-based RAG works unchanged against the bridge
+  (`model: "embeddinggemma-2-270m:latest"` on `/api/embed`).
+- The embedding model is intentionally **not** listed in `/v1/models` or
+  `/api/tags`: it exists for embed calls only, so chat clients can't pick it.
+  Embed requests accept any model name; omitting it defaults to
+  `embeddinggemma-2-270m`.
+
 ## Caveats that bite clients
 
 | Symptom | Cause / fix |
@@ -190,7 +215,7 @@ so it cannot be pointed at the Bonsai server. Use the LM Studio **chat**
 | Truncated or empty answer, `finish_reason: length` | Reasoning shares the output budget. Send `reasoning_effort: "none"` for quick turns, or raise `max_tokens`. The server never returns `content: null` on a text reply (it normalizes to `""`). |
 | `404` with a client base URL | Give the full base including `/v1` (e.g. `http://localhost:8080/v1`). The proxy also accepts the routes without `/v1` and with a trailing slash, but some clients add their own path segments. |
 | `400 model is required` | The client omitted `model`; every request must name `bonsai-2-27b`. |
-| Embeddings / RAG feature fails | The Splash engine serves no embeddings. `/v1/embeddings` returns a clear **501**; the Ollama bridge's `/api/embed*` returns 501. |
+| Embeddings / RAG feature fails | Shouldn't: `/v1/embeddings` works out of the box (EmbeddingGemma 2 via MLX). A **501** means embeddings are off (`BONSAI_EMBED=0`, or `mlx-vlm` missing from `.venv`); a **503** right after a restart means the ~580 MB model is still loading. |
 | Context looks too small | Default is 65536. Move the chat page's context slider (writes `.bonsai-ctx`) or set `BONSAI_CTX`; changing it restarts the server (~12–14 s). |
 | Reasoning text appears in the answer | `reasoning_content` is a separate field; clients that ignore it show only the answer. To reduce it, lower `reasoning_effort` per request. |
 | Images come back low-detail | The vision cap is 1024 tokens/image by default. Set `BONSAI_IMAGE_MAX_TOKENS=0` for full detail (4096). |

@@ -7,6 +7,13 @@
 # llama.cpp-only flags are translated to their Splash equivalents or ignored
 # with a note, and any Splash-native `splash serve` flag passes straight
 # through (e.g. --max-memory 20G, --kv-format bf16, --language-only).
+#
+# Children (all stopped by the TERM/INT trap):
+#   splash serve            the engine (loopback $ENGINE_PORT)
+#   openai_proxy.py         the public-port proxy (loopback + $HOST)
+#   embeddings_service.py   MLX EmbeddingGemma service (loopback $EMBED_PORT,
+#                           only when mlx-vlm is importable; set BONSAI_EMBED=0
+#                           to disable)
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -34,6 +41,11 @@ fi
 HOST="${BONSAI_HOST:-127.0.0.1}"
 PORT="${PORT:-8080}"
 ENGINE_PORT="${BONSAI_ENGINE_PORT:-$((PORT + 1))}"
+EMBED_PORT="${BONSAI_EMBED_PORT:-8082}"
+case "${BONSAI_EMBED:-1}" in
+    0|false|no|off) EMBED_ENABLED=0 ;;
+    *) EMBED_ENABLED=1 ;;
+esac
 
 # ── Find the Splash binary (launchd's PATH may miss Homebrew) ──
 SPLASH="$(splash_bin)"
@@ -54,6 +66,22 @@ if [ -z "$PROXY_PY" ]; then
     exit 1
 fi
 
+# ── Python for embeddings_service.py (needs mlx-vlm; only the venv has it) ──
+EMBED_PY=""
+if [ "$EMBED_ENABLED" = "1" ]; then
+    for _c in "$DEMO_DIR/.venv/bin/python3" "$DEMO_DIR/.venv/bin/python" \
+              "$(command -v python3 2>/dev/null || true)" /usr/bin/python3; do
+        if [ -n "$_c" ] && [ -x "$_c" ] && "$_c" -c "import mlx_vlm" >/dev/null 2>&1; then
+            EMBED_PY="$_c"
+            break
+        fi
+    done
+    if [ -z "$EMBED_PY" ]; then
+        warn "mlx-vlm is not installed in $DEMO_DIR/.venv; /v1/embeddings will return 501."
+        echo "  Install with:  uv pip install --python $DEMO_DIR/.venv/bin/python 'mlx-vlm'"
+    fi
+fi
+
 # ── Check the ports are free ──
 _CHECK_HOST="$HOST"
 [ "$_CHECK_HOST" = "0.0.0.0" ] && _CHECK_HOST="127.0.0.1"
@@ -65,6 +93,11 @@ fi
 if curl -s --max-time 2 "http://127.0.0.1:$ENGINE_PORT/health" >/dev/null 2>&1; then
     warn "A Bonsai engine is already running on port $ENGINE_PORT."
     echo "  Stop it first with:  kill \$(lsof -ti TCP:$ENGINE_PORT)"
+    exit 1
+fi
+if [ -n "$EMBED_PY" ] && curl -s --max-time 2 "http://127.0.0.1:$EMBED_PORT/health" >/dev/null 2>&1; then
+    warn "An embeddings service is already running on port $EMBED_PORT."
+    echo "  Stop it first with:  kill \$(lsof -ti TCP:$EMBED_PORT)"
     exit 1
 fi
 
@@ -196,6 +229,11 @@ echo ""
 echo "  Open http://localhost:$PORT in your browser to chat."
 echo "  API:  http://localhost:$PORT/v1/chat/completions"
 echo "  Engine: 127.0.0.1:$ENGINE_PORT (internal, proxied on $HOST:$PORT)"
+if [ -n "$EMBED_PY" ]; then
+    echo "  Embeddings: http://localhost:$PORT/v1/embeddings (EmbeddingGemma 2 270M via MLX)"
+else
+    echo "  Embeddings: disabled (mlx-vlm not installed in .venv; route returns 501)"
+fi
 echo "  Press Ctrl+C to stop."
 echo ""
 
@@ -232,11 +270,21 @@ if ! kill -0 "$PROXY" 2>/dev/null; then
     exit 1
 fi
 
+# The MLX embeddings service (loopback EMBED_PORT only). It loads EmbeddingGemma
+# 2 at startup — the first-ever run downloads ~580 MB — and the proxy answers
+# 503 until its /health is up. Started only when mlx-vlm is importable.
+EMBED=""
+if [ -n "$EMBED_PY" ]; then
+    BONSAI_EMBED_PORT="$EMBED_PORT" "$EMBED_PY" "$DEMO_DIR/embeddings_service.py" &
+    EMBED=$!
+fi
+
 _reap() {
     # server.server with our engine port = this instance's HTTP server; its
     # graceful shutdown also stops the serve-native engine child (the weights).
     pkill -TERM -f "server\.server .*--port[= ]${ENGINE_PORT}([^0-9]|$)" 2>/dev/null || :
     kill -TERM "$PROXY" 2>/dev/null || :
+    [ -n "$EMBED" ] && kill -TERM "$EMBED" 2>/dev/null || :
 }
 
 _stop_tree() {
@@ -245,17 +293,19 @@ _stop_tree() {
     kill -TERM "$CLI" 2>/dev/null || :
     wait "$CLI" 2>/dev/null || :
     wait "$PROXY" 2>/dev/null || :
+    [ -n "$EMBED" ] && wait "$EMBED" 2>/dev/null || :
     exit 0
 }
 trap '_stop_tree' TERM INT
 
-# Watch both children: whichever exits first ends the service, so launchd's
+# Watch the children: whichever exits first ends the service, so launchd's
 # KeepAlive brings the pair back (a dead proxy would otherwise leave the
 # engine up with nothing serving the public port).
 _RC=0
 while :; do
     kill -0 "$CLI" 2>/dev/null || break
     if ! kill -0 "$PROXY" 2>/dev/null; then _RC=3; break; fi
+    if [ -n "$EMBED" ] && ! kill -0 "$EMBED" 2>/dev/null; then _RC=3; break; fi
     sleep 1
 done
 if [ "$_RC" = 0 ]; then
@@ -268,4 +318,5 @@ fi
 _reap
 wait "$CLI" 2>/dev/null || :
 wait "$PROXY" 2>/dev/null || :
+[ -n "$EMBED" ] && wait "$EMBED" 2>/dev/null || :
 exit "$_RC"

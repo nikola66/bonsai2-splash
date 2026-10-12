@@ -42,6 +42,8 @@ BRIDGE_PORT="${BRIDGE_PORT:-11434}"
 # The engine itself binds loopback on the next port; openai_proxy.py owns $PORT
 # and serves loopback next to $HOST. Keep in sync with start_llama_server.sh.
 ENGINE_PORT="${BONSAI_ENGINE_PORT:-$((PORT + 1))}"
+# The MLX embeddings service (embeddings_service.py) is loopback-only.
+EMBED_PORT="${BONSAI_EMBED_PORT:-8082}"
 # A VPN/Tailscale address is a real interface, not 0.0.0.0, so it can be bound
 # directly and health-checked directly.
 CHECK_HOST="$HOST"
@@ -98,6 +100,9 @@ case "${1:-status}" in
         if server_health; then
             echo "READY  demo/API:  http://$CHECK_HOST:$PORT/          (OpenAI base: /v1, any key)"
             echo "       ollama:     http://$CHECK_HOST:$BRIDGE_PORT"
+            if curl -s --max-time 2 "http://127.0.0.1:$EMBED_PORT/health" >/dev/null 2>&1; then
+                echo "       embeddings: served at $CHECK_HOST:$PORT/v1/embeddings (MLX)"
+            fi
         else
             echo "NOT healthy after ~120s - see logs/bonsai-server.err.log"
             exit 1
@@ -152,6 +157,13 @@ case "${1:-status}" in
         fi
         bv=$(curl -s --max-time 2 "http://$CHECK_HOST:$BRIDGE_PORT/api/version" 2>/dev/null)
         [ -n "$bv" ] && echo "bridge: OK $bv" || echo "bridge: not answering"
+        if curl -s --max-time 2 "http://127.0.0.1:$EMBED_PORT/health" >/dev/null 2>&1; then
+            echo "embeddings: OK (EmbeddingGemma, http://127.0.0.1:$EMBED_PORT/health; public route /v1/embeddings)"
+        elif [ "${BONSAI_EMBED:-1}" = "0" ]; then
+            echo "embeddings: disabled (BONSAI_EMBED=0)"
+        else
+            echo "embeddings: not answering (mlx-vlm missing in .venv, or service down)"
+        fi
         rpid=$(pgrep -f "$SRV_PAT" | head -1)
         if [ -n "$rpid" ]; then
             _pids="$rpid"

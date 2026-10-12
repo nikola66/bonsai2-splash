@@ -51,7 +51,8 @@ client compatibility — see the bottom of this file (59 checks total).
   (e.g. `max_tokens=80` streaming produced 167 reasoning chars + 13 content chars, `finish=length`).
   Usage does report `reasoning_tokens` — good. Set `reasoning_effort` explicitly in OpenCode.
 - **`/v1/embeddings` → 404, `/api/embed*` → 501** (engine limitation, documented): any embedding/RAG
-  feature in a client will fail. No fix available on this engine.
+  feature in a client will fail. No fix available on this engine. *(Superseded 2026-10-12: the demo
+  now serves embeddings via a separate MLX EmbeddingGemma service — see the last section.)*
 - Long-context prefill is the dominant latency: 46K-token prompt = **172 s wall** (268 tok/s).
   Prefix cache makes the repeat **0.4 s** (`cache_n=46176`) — stable system prompts are effectively free
   on turn 2+.
@@ -127,7 +128,8 @@ OpenCode. Changes in `openai_proxy.py`:
   `Allow` header instead of the engine's 404.
 - **Unimplemented routes** — a known set (`/v1/embeddings`, audio, images,
   files, batches, moderations) is translated from the engine's bare 404 into a
-  clear **501** naming the route.
+  clear **501** naming the route. *(2026-10-12: `/v1/embeddings` left the set —
+  it is now served by the MLX EmbeddingGemma service; the rest still 501.)*
 - **Error envelope** — `error.param` is now present (`null`), matching the
   OpenAI shape clients parse.
 
@@ -146,6 +148,64 @@ so 64K-minimum clients (Hermes) work without configuration. Documented in
 The new suite asserts: base URL with/without `/v1`, trailing slashes, models
 shape (`object=list`, `context_length≥64000`, `vision`), `/v1/models/<id>`,
 CORS preflight + reflected headers + the Origin 403 guard, the error envelope
-(`param`), 405 with `Allow`, 501 for `/v1/embeddings`, `max_completion_tokens`,
+(`param`), 405 with `Allow`, `/v1/embeddings` shape (Matryoshka `dimensions`
+honored; tolerant of an honest 501/503 when disabled/loading),
+`max_completion_tokens`,
 `response_format: json_schema`, `stream_options.include_usage`, and a
 `/v1/responses` round-trip.
+
+---
+
+## Embeddings pass — 2026-10-12 · `/v1/embeddings` now served by MLX
+
+Splash has no pooling head, so the demo now ships its own embeddings service:
+
+- **`embeddings_service.py`** (new) — EmbeddingGemma 2 **text-only 270M**
+  (`gahabeen/embeddinggemma-2-text-270m-mlx-bf16`) running on the Metal GPU via
+  **MLX / mlx-vlm**. Loopback-only on `BONSAI_EMBED_PORT` (8082). OpenAI
+  `POST /v1/embeddings` (string or list `input`, `dimensions` 1..768 via
+  Matryoshka truncation + L2 renormalization, `encoding_format` float/base64,
+  `usage`), plus `/health`, `/status` and `/`. No llama.cpp anywhere on this
+  path.
+- **mlx-vlm 0.7.6 does not know `model_type: embedding_gemma2`** (verified
+  against the installed package: `Model type embedding_gemma2 not supported`).
+  Upstream added it on `main` on 2026-10-06, so the demo pins
+  `mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@fec3f503…` (0.7.7-dev) —
+  documented in `pyproject.toml` and the README install steps.
+- **`openai_proxy.py`** forwards `/v1/embeddings` to the service (removed it
+  from the 501 `UNSUPPORTED_ROUTES`): 400 for missing/bad `input`, **503** while
+  the service is unreachable, **501** when `BONSAI_EMBED=0`.
+- **`ollama_bridge.py`** implements `/api/embed` (`embeddings`, durations,
+  `prompt_eval_count`, `dimensions` passed through) and the legacy
+  `/api/embeddings` (`embedding`; single string → one vector, list → a list, the
+  shape OllamaEmbeddings integrations use).
+- Launcher (`scripts/start_llama_server.sh`) supervises it as a **third child**
+  (started when `mlx-vlm` is importable; `./bonsai.sh status` reports it;
+  `BONSAI_EMBED=0` disables).
+
+Live verification (M6 24 GB, service restarted under launchd):
+
+| Check | Result |
+|---|---|
+| `POST /v1/embeddings` single, default dims | 200, 768-dim, ‖v‖=1.0, `usage.prompt_tokens=9`, model echoed |
+| Batch + `dimensions:512` + base64 | 200, 2 vectors, decoded 512 floats, ‖v‖=1.0 |
+| Missing `input` / `dimensions:9999` | 400 (clear OpenAI error envelope) |
+| `POST /api/embed` (Ollama) | 200, 2 vectors @128, `prompt_eval_count`, durations |
+| `POST /api/embeddings` (legacy) | 200, single 768-dim `embedding` |
+| Model load | <1 s after first download (~580 MB); first request pays ~1 s compile |
+| Throughput (measured) | ~4 ms short query; ~10.5 K tok/s at 12K tokens |
+
+Regression suites re-run (all against the live service):
+
+| Suite | Checks | Result |
+|---|---|---|
+| `scripts/test_endpoint.py` | 23 | 0 failed |
+| `scripts/test_endpoint_followup.py` | 11 | 0 failed |
+| `scripts/test_endpoint_probe3.py` | 9 | 0 failed |
+| `scripts/test_endpoint_clients.py` | 16 | 0 failed |
+| **Total** | **59** | **0 failed** |
+
+The embeddings assertions changed from "clear 501" to "serves Matryoshka
+vectors": both `test_endpoint.py` (§11) and `test_endpoint_clients.py` (§D) POST
+a real request with `dimensions` 256/128 and require 200 + the right vector
+counts, tolerating an honest 501/503 (disabled/still loading) with a note.

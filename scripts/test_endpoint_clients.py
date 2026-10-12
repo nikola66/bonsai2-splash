@@ -11,7 +11,8 @@ generic OpenAI SDKs) rely on but the older suites did not exercise:
   * /v1/responses round-trip
   * max_completion_tokens honoured, json_schema, stream usage
   * the spec error envelope (`param` present)
-  * a clear 501 for routes Splash does not serve
+  * a clear 501 for routes Splash does not serve (embeddings are served by the
+    MLX EmbeddingGemma service and get their own shape check)
 
 BASE defaults to http://127.0.0.1:8080/v1; override with BONSAI_TEST_BASE.
 stdlib only (urllib), so it runs anywhere.
@@ -136,9 +137,26 @@ st, hdr, body, _ = req("GET", BASE + "/chat/completions")
 log("GET on POST route -> 405 with Allow", st == 405 and "POST" in hdr.get("allow", ""),
     f"status={st} allow={hdr.get('allow')}")
 
-st, _, body, _ = post("/embeddings", {"model": MODEL, "input": "hi"})
-log("unsupported /v1/embeddings -> clear 501",
-    st == 501 and "not served" in body.lower(), f"status={st} body={body[:140]}")
+# /v1/embeddings is served by the MLX EmbeddingGemma service standing behind the
+# proxy. Pass: 200 with Matryoshka vectors at the requested size, or an honest
+# 501/503 (disabled / still loading). Anything else is a regression.
+st, _, body, _ = post("/embeddings", {"model": MODEL, "input": ["hi", "bonjour"], "dimensions": 128})
+dims = []
+if st == 200:
+    try:
+        dat = json.loads(body)
+        dims = [len(e["embedding"]) for e in dat.get("data", [])]
+    except Exception:
+        dims = []
+if st == 200:
+    log("embeddings endpoint serves Matryoshka vectors (dimensions=128)",
+        dims == [128, 128], f"status={st} dims={dims}")
+elif st in (501, 503):
+    log("embeddings endpoint honestly disabled/loading (shape check skipped)",
+        True, f"status={st} body={body[:140]}")
+else:
+    log("embeddings endpoint reachable with expected status",
+        False, f"status={st} body={body[:140]}")
 
 print("\n=== E. Modern OpenAI request shapes ===")
 st, _, body, _ = post("/chat/completions",

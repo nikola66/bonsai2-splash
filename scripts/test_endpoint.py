@@ -425,9 +425,9 @@ for name, payload in cases:
         good = st in (400, 404, 422)
     log(f"error: {name}", good, f"status={st} body={str(body)[:200]}")
 
-# ------------------------------------------- 11. unsupported endpoint probing
+# ------------------------------------------- 11. embeddings + agent endpoints
 print("\n=== 11. Agent-required endpoints ===")
-for path, method in [("/embeddings", "POST"), ("/completions", "POST"), ("/chat/completions", "GET")]:
+for path, method in [("/completions", "POST"), ("/chat/completions", "GET")]:
     req = urllib.request.Request(BASE + path, data=b"{}" if method == "POST" else None,
                                  headers={"Content-Type": "application/json"}, method=method)
     try:
@@ -438,6 +438,28 @@ for path, method in [("/embeddings", "POST"), ("/completions", "POST"), ("/chat/
     except Exception as e:
         st, body = None, str(e)
     log(f"{method} {path} reachable", st is not None, f"status={st} body={str(body)[:150]}")
+
+# /v1/embeddings is answered by the MLX EmbeddingGemma service (Splash has no
+# pooling head). Pass: 200 with the right Matryoshka shape, or an honest 501/503
+# when embeddings are disabled/still loading. Anything else is a regression.
+# Note: `post` here returns the JSON body already parsed.
+st, body, _, _ = post("/embeddings", {"model": MODEL, "input": ["hello", "world"], "dimensions": 256})
+dims = []
+if st == 200 and isinstance(body, dict):
+    try:
+        dims = [len(d["embedding"]) for d in body.get("data", [])]
+    except Exception:
+        dims = []
+if st == 200:
+    log("POST /v1/embeddings -> MRL vectors (dimensions=256 honored)",
+        dims == [256, 256], f"status={st} dims={dims} body={str(body)[:140]}")
+elif st in (501, 503):
+    log("POST /v1/embeddings honestly disabled/loading (shape check skipped)",
+        True, f"status={st} body={str(body)[:140]}")
+    notes.append(f"/v1/embeddings answered {st} (embeddings disabled or still loading)")
+else:
+    log("POST /v1/embeddings reachable with expected status",
+        False, f"status={st} body={str(body)[:140]}")
 
 # ------------------------------------------- summary
 print("\n" + "=" * 70)

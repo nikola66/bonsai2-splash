@@ -8,7 +8,8 @@ it behind an authenticating network, before exposing it:
     GET  /api/version, /api/tags, /api/ps, /health
     POST /api/chat, /api/generate  -> /v1/chat/completions (SSE -> NDJSON)
     POST /api/show                 -> model metadata
-    POST /api/embed, /api/embeddings -> not served by Splash (501)
+    POST /api/embed, /api/embeddings -> /v1/embeddings (the MLX EmbeddingGemma
+         service via openai_proxy.py; accepts `dimensions` for MRL truncation)
 
     GET/POST /bonsai/context       -> context-window control for the web UI:
     writes .bonsai-ctx (read by bonsai-service.sh), then SIGTERMs splash serve
@@ -26,6 +27,7 @@ import re
 import signal
 import subprocess
 import threading
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -70,6 +72,11 @@ ENGINE_PORT = int(_EPORT) if _EPORT else int(_setting("PORT", "8080")) + 1
 OLLAMA_VERSION = os.environ.get("BRIDGE_OLLAMA_VERSION", "0.5.13")
 GGUF_DIR = DEMO_DIR / "models" / "bonsai2-gguf" / "27B"
 TIMEOUT = httpx.Timeout(600.0, connect=10.0)
+
+# Embeddings are served by the MLX EmbeddingGemma service through the proxy's
+# /v1/embeddings. Any model name in an embed request is accepted (echoed back);
+# this is the name used when the client omits one.
+EMBED_MODEL = os.environ.get("EMBED_MODEL", "embeddinggemma-2-270m")
 
 # Context-window control (web UI): persisted here, read by bonsai-service.sh.
 CTX_FILE = DEMO_DIR / ".bonsai-ctx"
@@ -777,9 +784,39 @@ class Handler(BaseHTTPRequestHandler):
         })
 
     def _handle_embed(self, req, path):
-        # The Splash engine has no embeddings endpoint (the old llama.cpp
-        # server had /v1/embeddings); answer clearly instead of proxying.
-        return self._error(501, "embeddings are not served by the Splash engine")
+        """Ollama /api/embed and legacy /api/embeddings -> the proxy's
+        /v1/embeddings, answered by the MLX EmbeddingGemma service."""
+        legacy = path == "/api/embeddings"
+        inp = req.get("prompt") if legacy else req.get("input")
+        if inp is None:
+            return self._error(400, f"`{'prompt' if legacy else 'input'}` is required")
+        body = {"model": req.get("model") or EMBED_MODEL, "input": inp}
+        dim = req.get("dimensions")
+        if isinstance(dim, int) and not isinstance(dim, bool) and dim > 0:
+            body["dimensions"] = dim
+        t0 = time.monotonic()
+        with _client() as c:
+            r = c.post(f"{UPSTREAM}/v1/embeddings", json=body)
+            if r.status_code >= 400:
+                return self._error(r.status_code, f"upstream {r.status_code}: {r.text[:300]}")
+            data = r.json()
+        elapsed = int((time.monotonic() - t0) * 1e9)
+        vecs = [d["embedding"] for d in data.get("data", [])]
+        if not vecs:
+            return self._error(500, "embedding service returned no vectors")
+        if legacy:
+            # Legacy shape: a single string prompt -> one vector; a list ->
+            # a list of vectors (the shape OllamaEmbeddings integrations used).
+            return self._send_json({"embedding": vecs[0] if isinstance(inp, str) else vecs})
+        usage = data.get("usage") or {}
+        return self._send_json({
+            "model": req.get("model") or EMBED_MODEL,
+            "embeddings": vecs,
+            "total_duration": elapsed,
+            "load_duration": 0,
+            "prompt_eval_count": usage.get("prompt_tokens", 0),
+            "prompt_eval_duration": elapsed,
+        })
 
 
 def main():

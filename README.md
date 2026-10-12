@@ -46,6 +46,9 @@ projector) into Splash's cache. Later starts load in about 4 seconds.
   per-request control via `reasoning_effort` (server default: `low`).
 - **Vision** — images and PDFs, with a token cap you control.
 - **Native tool calling** — OpenAI `tool_calls` with full round-trips.
+- **Embeddings** — OpenAI-compatible `/v1/embeddings` (and the Ollama bridge's
+  `/api/embed*`), served by a lightweight **EmbeddingGemma 2** model running on
+  the Metal GPU via **MLX** — no llama.cpp required.
 - **A launchd service** that starts everything at login and releases all model
   memory on stop.
 
@@ -57,6 +60,7 @@ projector) into Splash's cache. Later starts load in about 4 seconds.
 | macOS | 26.4 or newer |
 | Memory | 24 GB works well; 16 GB is usable with a smaller context (see [Context](#context-window)) |
 | Engine | `brew install incoai/tap/splash` |
+| Python | 3.10+ for the bridge and the optional embeddings service |
 
 There is no CPU, Windows or Linux path — Splash is Apple-only.
 
@@ -69,8 +73,10 @@ cd bonsai2-splash
 # 1. The engine
 brew install incoai/tap/splash
 
-# 2. Python env for the Ollama bridge (httpx only)
+# 2. Python env for the bridge and embeddings (needs Python >= 3.10)
 python3 -m venv .venv && .venv/bin/pip install httpx
+# Embeddings (/v1/embeddings) are optional: they need one more package in .venv.
+.venv/bin/pip install 'mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@fec3f50379bb2cb0760ef3c8a68ebce9585e4d97'
 
 # 3. Run it in the foreground
 ./scripts/start_llama_server.sh
@@ -114,6 +120,32 @@ use it rather than guessing from wall-clock time.
 **MCP tools are configured in your client**, not here. The server serves a model;
 Splash does not host MCP servers. Your agent or IDE's own MCP config is the place
 for that.
+
+## Embeddings (optional)
+
+Splash is a chat engine with no pooling head, so the demo ships its own
+embeddings service: a **text-only EmbeddingGemma 2 (270M)** running on the Metal
+GPU through **MLX** (`embeddings_service.py`, loopback port 8082). It starts
+automatically when `mlx-vlm` is installed in `.venv` and answers the OpenAI
+`/v1/embeddings` route on the main port. Without it the route returns a clear
+501, and `BONSAI_EMBED=0` disables it explicitly.
+
+```bash
+# OpenAI clients — Dimensions 128/256/512 truncate (Matryoshka) and renormalize.
+curl -s http://localhost:8080/v1/embeddings -H 'Content-Type: application/json' \
+  -d '{"model":"embeddinggemma-2-270m","input":["query: Paris","Paris is the capital of France"],"dimensions":256}' \
+  | python3 -m json.tool | head -20
+
+# Ollama clients
+curl -s http://localhost:11434/api/embed -H 'Content-Type: application/json' \
+  -d '{"model":"embeddinggemma-2-270m:latest","input":["hello","world"]}'
+```
+
+Details: 768 dims by default (`BONSAI_EMBED_DIM`), unit-length (L2-normalized)
+vectors, `encoding_format` `float`/`base64`, per-input cap 8192 tokens
+(`BONSAI_EMBED_MAX_TOKENS`), first run downloads ~580 MB. The embedding model is
+not listed in `/v1/models` or `/api/tags`, because chat clients must not select
+it. Full variable reference in [environment_variables.md](environment_variables.md).
 
 ## Configuration
 
@@ -230,10 +262,12 @@ interface must exist first; the proxy retries every 30 s until it does, and
 loopback keeps serving in the meantime. `./bonsai.sh status` and
 `logs/bonsai-server.err.log` show what happened.
 
-**Something needs embeddings** — Splash does not serve them: `/v1/embeddings`
-returns 404, and the bridge's `/api/embed` returns 501 with
-`embeddings are not served by the Splash engine`. The llama.cpp setup this
-replaces did serve them.
+**Something needs embeddings** — they are served: `/v1/embeddings` answers with
+EmbeddingGemma 2 vectors (768 dims, `dimensions` optional), and the bridge's
+`/api/embed` works too. If instead you get a **501**, the embeddings service is
+off — `mlx-vlm` is missing from `.venv` (install it, step 2 above) or
+`BONSAI_EMBED=0`. A **503** right after a restart just means the ~580 MB
+model is still loading; retry in a few seconds.
 
 ## How it fits together
 
@@ -245,9 +279,12 @@ bonsai.env               your bind address and ports (copy from the example)
 openai_proxy.py          public-port proxy: loopback always served, model
                          enforced, content never null (normalizes the engine)
 ollama_bridge.py         Ollama API → OpenAI translation
+embeddings_service.py    MLX EmbeddingGemma service (loopback 8082) — the
+                         proxy forwards /v1/embeddings here
 scripts/
   start_llama_server.sh  server launcher: splash serve (loopback engine) +
-                         openai_proxy.py on the public port
+                         openai_proxy.py on the public port + the embeddings
+                         service (loopback 8082)
   common.sh              shared launcher logic
   benchmark.py           measure a running server and emit a report
   test_endpoint*.py      endpoint regression suites (59 checks)
@@ -256,8 +293,10 @@ scripts/
 Flow: `bonsai.sh` → `bonsai-service.sh` → `scripts/start_llama_server.sh` →
 `splash serve` (engine on `127.0.0.1:PORT+1`) + `openai_proxy.py` (public
 `PORT`: `BONSAI_HOST` + loopback). The bridge sits beside the server and
-translates Ollama requests to its OpenAI API. Any Splash-native flag can be
-passed through:
+translates Ollama requests to its OpenAI API. When `mlx-vlm` is installed, a
+third child (`embeddings_service.py`, loopback `BONSAI_EMBED_PORT`, default
+8082) serves `/v1/embeddings` for the proxy and the bridge. Any Splash-native
+flag can be passed through:
 
 ```bash
 ./scripts/start_llama_server.sh --max-memory 20G --language-only

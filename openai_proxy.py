@@ -28,8 +28,13 @@ behaviour the engine itself does not implement:
     proper preflight answer, so a web UI on another origin can talk to a
     loopback server with no proxy setup.
   * **Honest unsupported routes.** OpenAI routes Splash does not implement
-    (embeddings, audio, images, files, batches, moderations) are answered with
-    a clear 501 instead of the engine's bare 404 "not found".
+    (audio, images, files, batches, moderations) are answered with a clear 501
+    instead of the engine's bare 404 "not found".
+  * **Embeddings.** Splash is a causal chat engine with no pooling head, so
+    `/v1/embeddings` is answered by a separate, small MLX service
+    (`embeddings_service.py`, loopback `BONSAI_EMBED_PORT`) that this proxy
+    forwards to. Errors name the service, and `BONSAI_EMBED=0` turns the route
+    back into a clear 501.
 
 Everything else passes through byte-for-byte: the chat page, /v1/models,
 /health, /ready, /status, SSE streams (including tool-call deltas), uploads,
@@ -41,6 +46,8 @@ git-ignored bonsai.env, which wins over defaults):
     BONSAI_HOST          public bind address (default 127.0.0.1)
     PORT                 public port (default 8080)
     BONSAI_ENGINE_PORT   engine port (default PORT + 1, loopback only)
+    BONSAI_EMBED         enable /v1/embeddings (default 1; 0 answers 501)
+    BONSAI_EMBED_PORT    embeddings service port (default 8082, loopback only)
 
 Started and stopped by scripts/start_llama_server.sh. Standard library only.
 """
@@ -85,8 +92,13 @@ HOST = _setting("BONSAI_HOST", "127.0.0.1")
 PORT = int(_setting("PORT", "8080"))
 ENGINE_PORT = int(_setting("BONSAI_ENGINE_PORT", str(PORT + 1)))
 BRIDGE_PORT = int(_setting("BRIDGE_PORT", "11434"))
+EMBED_PORT = int(_setting("BONSAI_EMBED_PORT", "8082"))
 ENGINE = ("127.0.0.1", ENGINE_PORT)
 BRIDGE = ("127.0.0.1", BRIDGE_PORT)
+EMBED = ("127.0.0.1", EMBED_PORT)
+EMBED_ENABLED = _setting("BONSAI_EMBED", "1").strip().lower() not in (
+    "0", "false", "no", "off",
+)
 
 # OpenAI requires `model` on its text routes; the engine accepts these
 # requests without one (only its Anthropic route validates the field).
@@ -122,8 +134,8 @@ ROUTE_METHODS = {
 # OpenAI routes the Splash engine does not implement. The engine answers a bare
 # 404, which clients log as a routing bug; the proxy turns that into an explicit
 # 501 (only when the engine 404s, so a future engine addition is not shadowed).
+# `/v1/embeddings` is NOT here: it is served by embeddings_service.py.
 UNSUPPORTED_ROUTES = {
-    "/v1/embeddings": "embeddings",
     "/v1/audio/transcriptions": "audio transcription",
     "/v1/audio/speech": "speech synthesis",
     "/v1/images/generations": "image generation",
@@ -744,6 +756,86 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 except OSError:
                     pass
 
+    def _relay_embeddings(self, body: bytes | None, t0: float) -> None:
+        """Forward POST /v1/embeddings to the MLX embeddings service."""
+        path = "/v1/embeddings"
+        if not EMBED_ENABLED:
+            self._send_json(
+                501,
+                _error_body(
+                    "embeddings are disabled on this server (set BONSAI_EMBED=1 "
+                    "to enable them)",
+                    "api_error",
+                ),
+            )
+            self._log_line(path, 501, t0, "disabled")
+            return
+        if body is None:
+            self._send_json(400, _error_body("request body is required"))
+            self._log_line(path, 400, t0, "empty body")
+            return
+        try:
+            parsed = json.loads(body)
+        except ValueError:
+            self._send_json(400, _error_body("request body must be valid JSON"))
+            self._log_line(path, 400, t0, "bad json")
+            return
+        if not isinstance(parsed, dict) or not parsed.get("input"):
+            self._send_json(
+                400,
+                _error_body("`input` is required and must be a string or list of strings"),
+            )
+            self._log_line(path, 400, t0, "missing input")
+            return
+
+        conn: HTTPConnection | None = None
+        try:
+            fwd: dict[str, str] = {}
+            for key, value in self.headers.items():
+                if key.lower() in HOP_BY_HOP or key.lower() in ("host", "origin"):
+                    continue
+                fwd[key] = value
+            fwd["Connection"] = "close"
+            conn = HTTPConnection(EMBED[0], EMBED[1], timeout=120.0)
+            try:
+                conn.request("POST", "/v1/embeddings", body=body, headers=fwd)
+                resp = conn.getresponse()
+            except (OSError, HTTPException) as exc:
+                self._send_json(
+                    503,
+                    _error_body(
+                        f"embeddings service unavailable on port {EMBED_PORT} ("
+                        f"{exc}). It is started by start_llama_server.sh; "
+                        "install mlx-vlm in the demo venv to enable it.",
+                        "api_error",
+                    ),
+                )
+                self._log_line(path, 503, t0, "embeddings service unavailable")
+                return
+            data = resp.read()
+            headers = [
+                (k, v)
+                for k, v in resp.headers.items()
+                if k.lower() not in ("connection", "keep-alive", "transfer-encoding", "content-length")
+            ]
+            self.send_response_only(resp.status, resp.reason)
+            for key, value in headers:
+                self.send_header(key, value)
+            for key, value in self._cors_headers():
+                self.send_header(key, value)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            self._log_line(path, resp.status, t0)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+
     def _maybe_patch_page(self, data: bytes, ctype: str) -> bytes:
         if "text/html" not in ctype or PAGE_PATTERN not in data:
             return data
@@ -824,6 +916,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
             # a direct http://...:11434/bonsai/context call.
             if path == "/bonsai/context":
                 self._relay_bridge(body, t0)
+                return
+
+            # Embeddings live in their own MLX service (Splash has no pooling
+            # head). Forward the request there; answer 501 when disabled or
+            # 503 while the service is still coming up.
+            if path == "/v1/embeddings":
+                self._relay_embeddings(body, t0)
                 return
 
             # Parse the body only where the proxy gates or normalizes it.

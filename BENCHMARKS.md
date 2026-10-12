@@ -66,9 +66,13 @@ Two behavioural differences worth knowing before you compare numbers:
 
 - **Speculative decoding is always on** in Splash. There is no switch to turn it
   off; it is not separately configurable.
-- **No embeddings endpoint.** `/v1/embeddings` returns 404 and the bridge's
-  `/api/embed` returns 501. The old engine served them. Anything depending on
-  embeddings will break.
+- **Embeddings are a separate MLX service.** Splash serves none (no pooling
+  head), so the demo runs EmbeddingGemma 2 (text-only 270M) on the Metal GPU via
+  mlx-vlm and forwards `/v1/embeddings` to it. Measured steady-state on M6 24 GB
+  (real compute; MRL truncation to 128/256/512 costs nothing extra):
+  ~**4 ms** per short query and **~10–25 K tok/s** on longer inputs (12K tokens
+  in ~1.1 s). The model loads in <1 s (~0.6 GB resident); the first request pays
+  a one-time ~1 s compile. First-ever run downloads ~580 MB from Hugging Face.
 
 ## Methodology notes
 

@@ -7,7 +7,7 @@ The demo runs on the **Splash** engine ([incoai/splash](https://github.com/incoa
 ## Precedence
 
 1. The real environment (what you export, or what `launchd` passes through).
-2. `bonsai.env` in the repo root — copy `bonsai.env.example` and edit it. Read by `bonsai.sh`, `bonsai-service.sh` and `ollama_bridge.py`, so the CLI and the service never disagree.
+2. `bonsai.env` in the repo root — copy `bonsai.env.example` and edit it. Read by `bonsai.sh`, `bonsai-service.sh`, `ollama_bridge.py` and `embeddings_service.py`, so the CLI and the service never disagree.
 3. The defaults below.
 
 `bonsai.env` is parsed as plain `KEY=value` pairs; it is not sourced as shell, so
@@ -46,6 +46,26 @@ a value cannot execute anything.
 - **Translated:** `-c` / `--ctx-size` → `--max-context`; `--alias` → `--served-model-name` + `--announce-served-name`; `--model`/`-m` → the served model id; `--image-max-tokens N` → `--max-image-pixels N*1024`; `--reasoning-budget` → `--default-reasoning-effort` (`0` → `none`, `≤512` → `low`, `≤2048` → `medium`, `≤8192` → `high`, else `max`); `--reasoning-budget -1` → engine model default. If no reasoning flag is supplied, the launcher defaults thinking to `--default-reasoning-effort low`; `--chat-template-kwargs '{"enable_thinking": false}'` → `--default-reasoning-effort none`.
 - **Ignored with a note:** `--jinja`, `-fa`, `-ngl`, `--temp/--top-p/--top-k/--min-p`, `--spec-type`, `--spec-draft-n-max`, `--parallel`/`-np`, `--mmproj`, `--cache-type-k/-v`, `--kv-mean-center`, `--cache-reuse`, `-ub`, `--reasoning-format`, `--webui-config-file`, `-v`, …
 - **Passed through:** anything else is handed to `splash serve` verbatim (its own flags work here; a typo makes Splash print its usage).
+
+## Embeddings (`embeddings_service.py`, optional)
+
+Splash has no pooling head, so `/v1/embeddings` is served by a separate MLX
+service (EmbeddingGemma 2, text-only 270M) started by the launcher as a third
+child. It runs only when `mlx-vlm` is importable in `.venv`; otherwise the route
+returns a clear 501. `BONSAI_EMBED=0` disables it explicitly.
+
+| Variable | Default | Valid values | Purpose |
+|----------|---------|--------------|---------|
+| `BONSAI_EMBED` | `1` | `1`, `0` | Serve `/v1/embeddings` (via the MLX service). `0` makes the route answer 501. |
+| `BONSAI_EMBED_MODEL` | `gahabeen/embeddinggemma-2-text-270m-mlx-bf16` | HF repo id | The text-only EmbeddingGemma 2 conversion mlx-vlm loads (first run downloads ~580 MB). |
+| `BONSAI_EMBED_PORT` | `8082` | port | Loopback port of the embeddings service; only `openai_proxy.py` and the Ollama bridge talk to it. |
+| `BONSAI_EMBED_DIM` | `768` | `1`–`768` | Default output size when a request omits `dimensions`. EmbeddingGemma is Matryoshka (MRL): smaller sizes (128/256/512) truncate and re-normalize. |
+| `BONSAI_EMBED_MAX_TOKENS` | `8192` | number | Per-input token cap (EmbeddingGemma's native context is 8K tokens). |
+
+`POST /v1/embeddings` accepts the OpenAI shape: `input` (string or list of
+strings), optional `dimensions` (MRL truncation, re-normalized) and
+`encoding_format` (`float`/`base64`). Responses carry the standard
+`data[].embedding` + `usage` fields.
 
 ## Ollama bridge (`ollama_bridge.py`)
 
