@@ -51,12 +51,15 @@ All extra args pass through the start script, e.g.
 
 | Knob | What it does | Trade-off |
 |---|---|---|
-| `BONSAI_CTX=N` | Forces `--max-context N` (≤ 262144). Unset = RAM-tiered default (65536 on a 24 GB machine); the launchd service also reads `.bonsai-ctx` (chat-page slider, 8192–262144, default 65536). | More context = more KV memory. At `int8` KV ≈ 32 KiB/token, so 64K ≈ 2 GB and the machine's plan allows ~188K total. Pair very long contexts with `BONSAI_MAX_CACHE_DISK` on tight machines. |
+| `BONSAI_CTX=N` | Forces `--max-context N` (≤ 262144). Unset = RAM-tiered default (131072 on a 24 GB machine); the launchd service also reads `.bonsai-ctx` (chat-page slider, 8192–262144). | More context = more KV memory. At `int8` KV ≈ 32 KiB/token, so 64K ≈ 2 GB and the machine's plan reserves ~5.99 GB for ~180K tokens, which is why 131072 costs nothing extra — KV grows with use, not with the cap. Pair very long contexts with `BONSAI_MAX_CACHE_DISK` on tight machines. |
+| `BONSAI_AGENT_EFFORT` | `none`. The proxy applies it to requests that carry `tools` and set no `reasoning_effort`. | Thinking is spent from the same `max_tokens` as the answer: inheriting `low` made agent turns return `content: ""` with `finish_reason: "length"` whenever a client capped output near 1K. Set `off` to disable, or `low` if you want reasoning back on agent turns and can guarantee `max_tokens ≥ 8192`. |
 | `BONSAI_IMAGE_MAX_TOKENS=N` | Vision tokens per image → `--max-image-pixels N*1024`. Default **1024**; `0` = uncapped (Splash's 4096 tokens / 4.2 MP). | **Ask the user** (below). |
 | `BONSAI_IDLE_RELEASE=off\|30s\|10m…` | Splash frees model memory after N idle; the next request restores it from disk in seconds. Default `off` (stays resident). | On 24 GB, `10m` returns ~11 GB when idle but the first message after idle pays a reload. Good for machines that are off most of the day. |
 | `BONSAI_MAX_MEMORY=size` | Caps Splash's working-set budget (`--max-memory 20G`). | Default: Splash derives it from free memory at start. |
 | `BONSAI_MAX_CACHE_DISK=size` | SSD tier for KV/prefix cache blocks (`--max-cache-disk 16G`). | **Writes to disk.** Only for very long contexts on tight machines. |
 | `BONSAI_KV_FORMAT` | `int8` (default, about half the KV memory of the old FP16) or `bf16`. | bf16 = full precision, 2× KV memory, marginal quality gain at very long context. |
+| `BONSAI_REASONING_EFFORT` | Server default thinking level (`none`–`max`, default `medium`). | Per-request `reasoning_effort` still wins. Use `medium`: the model card says `low` is unsupported and behaves close to `xhigh`, so it silently buys near-maximum thinking. `none` is fastest for retrieval/reformat turns. |
+| `BONSAI_MAX_CACHE_DISK` + `BONSAI_PERSISTENT_CACHE` | SSD prefix cache (`16G` + `1` = restart-proof). | Verified 0.6 s post-restart replay vs 20.2 s fresh. Opt-in: real SSD writes. |
 | `BONSAI_LANGUAGE_ONLY=1` | Skip the vision tower entirely. | Slightly lighter and faster start; refuses image input. |
 | `BONSAI_EMBED=0` | Turn off the MLX embeddings service (`/v1/embeddings` answers 501). | Embeddings are off by default only if `mlx-vlm` is missing from `.venv`; `BONSAI_EMBED_MODEL`/`PORT`/`DIM`/`MAX_TOKENS` tune the service. |
 | `--reasoning-budget N` (legacy flag) | Mapped to `--default-reasoning-effort`: `0`→`none`, `≤512`→`low`, `≤2048`→`medium`, `≤8192`→`high`, else `max`. | Prefer `--default-reasoning-effort` or per-request `reasoning_effort`. |
@@ -78,8 +81,10 @@ DFlash2 draft. The old `BONSAI_SPECULATIVE` switch is gone with the fork.
    slower per large image)?
 2. **Idle memory** — keep `BONSAI_IDLE_RELEASE=off` (always ready) or `10m`
    (reclaim ~11 GB while idle; first message after idle waits for a reload)?
-3. **Context** — leave the service at 65536 / the slider value, or force
-   `BONSAI_CTX`? Contexts over 100K cost real KV memory (32 KiB/token).
+3. **Context** — leave the service at 131072 / the slider value, or force
+   `BONSAI_CTX`? Contexts over 100K cost real decode speed (attention over a
+   longer KV is ~28 tok/s at 49K vs 54 tok/s under 4K), even though the memory
+   is already reserved.
 
 ## What works with no extra setup
 
@@ -109,7 +114,7 @@ DFlash2 draft. The old `BONSAI_SPECULATIVE` switch is gone with the fork.
   but both names resolve), `/api/chat` (NDJSON, `think` honored →
   `reasoning_effort`, images mapped to data URIs), `/api/version`, plus
   `GET/POST /bonsai/context` (writes `.bonsai-ctx` and restarts the server with
-  the new `--max-context`; ~12–14 s, verified at 65536 → 131072 → 65536).
+  the new `--max-context`; ~12–14 s, verified across 8192 → 65536 → 131072).
 
 ## Behaviour notes (measured: M6 24 GB, Splash 1.3.0)
 
@@ -120,6 +125,16 @@ DFlash2 draft. The old `BONSAI_SPECULATIVE` switch is gone with the fork.
   ~15–21 s. The first-ever run downloads ~10 GB from Hugging Face first.
 - **Thinking dominates "slow answers"**, not the engine. Cap it per chat with the
   reasoning-effort picker or `reasoning_effort` before blaming hardware.
+- **Agent loops fail on two things, both client-side.** (1) `reasoning_effort`
+  is spent from the same `max_tokens` as the answer, so a client capping output
+  at ~1K gets `content: ""` with `finish_reason: "length"` and stalls — measured
+  4/4 empty turns at `low` + 1024. The proxy now applies `BONSAI_AGENT_EFFORT`
+  (`none`) to tool-carrying requests that set no effort. (2) The prefix cache
+  keys on the *front* of the rendered prompt, so a tool-list change or a
+  timestamp prepended to the system prompt costs a full re-prefill: 17.1 s on a
+  5.4K prompt, 115 s at 28K. The proxy sorts `tools` by name and logs an
+  8-character `prefix` fingerprint per chat request; identical fingerprints
+  mean the miss is impossible.
 - **Memory** — the running stack costs ~11 GB of pressure (engine RSS ~3.3 GB,
   since weights are file-backed) plus ~0.6 GB resident for the MLX embeddings
   service when enabled; `./bonsai.sh stop` frees all of it (measured:

@@ -161,6 +161,8 @@ The knobs you are most likely to want, all optional:
 | `BONSAI_IMAGE_MAX_TOKENS` | `1024` | Vision tokens per image; `0` = uncapped (4096). |
 | `BONSAI_IDLE_RELEASE` | `off` | Free model memory after N idle (`30s`, `10m`, …). |
 | `BONSAI_KV_FORMAT` | `int8` | KV cache: `int8` (small) or `bf16` (full precision). |
+| `BONSAI_REASONING_EFFORT` | `medium` | Default thinking level (`none`–`max`); per-request `reasoning_effort` still wins. **Not `low`** — upstream documents `low` as unsupported, behaving close to `xhigh`. |
+| `BONSAI_MAX_CACHE_DISK` + `BONSAI_PERSISTENT_CACHE` | unset / `0` | Restart-proof prefix cache, e.g. `16G` + `1`: replayed prompts survive restarts (measured 0.6 s vs 20.2 s fresh). SSD writes — opt in only. |
 
 Full reference, including legacy variables that are accepted but ignored:
 **[environment_variables.md](environment_variables.md)**.
@@ -183,10 +185,12 @@ idle, at the cost of a few seconds on the first request after a long pause.
 
 ### Context window
 
-Default is RAM-tiered (65536 on a 24 GB machine — chosen so agent harnesses
-that require a 64K minimum, such as Hermes, work out of the box); the launchd
-service pins 65536, or the value in `.bonsai-ctx` written by the chat page's
-context slider (8192–262144). Force one for any run:
+Default is RAM-tiered (131072 on a 24 GB machine — agent harnesses that require
+a 64K minimum, such as Hermes, work out of the box, and real coding-agent
+sessions run at p90 44K / max 56K input tokens, so 64K used to fail them
+mid-task); the launchd service reads the value in `.bonsai-ctx` written by the
+chat page's context slider (8192–262144), and otherwise uses the same tier.
+Force one for any run:
 
 ```bash
 BONSAI_CTX=131072 ./scripts/start_llama_server.sh
@@ -300,6 +304,48 @@ flag can be passed through:
 
 ```bash
 ./scripts/start_llama_server.sh --max-memory 20G --language-only
+```
+
+## Where everything lives
+
+This checkout keeps its data inside the folder instead of the home directory:
+
+| What | Path | Size |
+|---|---|---|
+| Weights, DFlash2 draft, vision projector, embeddings model | `.cache/huggingface/` (`HF_HOME`) | ~12 GB |
+| Persistent prefix cache | `.cache/splash/prefix-cache/` (`--cache-dir`) | up to `BONSAI_MAX_CACHE_DISK` |
+| Splash catalog / runtime state | `.cache/splash/state/` | ~19 MB |
+
+Two Splash paths are hardcoded to the home directory and cannot be redirected by
+environment variable, so they are symlinks into the folder:
+`~/Library/Application Support/Splash` → `.cache/splash/state`, and
+`~/Library/Caches/Splash/prefix-cache` → `.cache/splash/prefix-cache`. The bytes
+live here; only the pointers stay outside. `.cache/` is git-ignored.
+
+The one thing still installed system-wide is the **Splash engine itself**
+(`brew install incoai/tap/splash`, ~244 MB under `/opt/homebrew`) — a
+package-manager tool, like the Xcode Command Line Tools a source-built engine
+needs.
+
+### Running alongside Strata
+
+The sibling `Strata-demo` checkout serves Qwen3.8-Flash-Next and is configured to
+stay out of this server's way:
+
+| Port | Owner |
+|---|---|
+| **8080** | **Bonsai proxy — chat page + OpenAI API (this server)** |
+| 8081 | Bonsai engine (internal) |
+| 8082 | Bonsai embeddings (internal) |
+| 11434 | Bonsai Ollama bridge |
+| 8090 | Strata |
+
+**Only one engine at a time on 24 GB.** Bonsai holds ~11 GB resident; Strata wires
+a 9 GB expert arena. Running both swaps. Hand over explicitly:
+
+```bash
+./bonsai.sh stop && (cd ../Strata-demo && ./strata.sh start)    # to Strata
+(cd ../Strata-demo && ./strata.sh stop) && ./bonsai.sh start    # back to Bonsai
 ```
 
 ## Further reading

@@ -25,6 +25,11 @@ logs/
 *.log
 reports/
 
+# Model weights + Splash prefix cache, relocated here so nothing this demo
+# downloads or writes lands in ~/.cache or ~/Library/Caches (see
+# scripts/start_llama_server.sh). ~28 GB — never commit.
+.cache/
+
 # Credentials — never commit
 .prism_hf_token
 .bonsai_token

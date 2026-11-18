@@ -33,6 +33,15 @@ if [ -f "$DEMO_DIR/bonsai.env" ]; then
     [ -n "$_keep_eport" ] && BONSAI_ENGINE_PORT="$_keep_eport"
 fi
 
+# ── Keep the weights and the SSD prefix cache inside this checkout ──
+# Splash resolves model files through huggingface_hub (which honours HF_HOME)
+# and keeps its persistent prefix cache in ~/Library/Caches/Splash by default.
+# Both are pointed at .cache/ here so the ~12 GB of weights and the prefix cache
+# live in the project folder, not scattered across the home directory.
+# Override HF_HOME or BONSAI_CACHE_DIR to put them somewhere else.
+export HF_HOME="${HF_HOME:-$DEMO_DIR/.cache/huggingface}"
+BONSAI_CACHE_DIR="${BONSAI_CACHE_DIR:-$DEMO_DIR/.cache/splash/prefix-cache}"
+
 # Bind to loopback by default; override with BONSAI_HOST=0.0.0.0 for LAN/remote.
 # There is no authentication, so the bind address is the access control.
 # openai_proxy.py owns $PORT and always serves loopback next to $HOST (the
@@ -119,7 +128,19 @@ MODEL="$BONSAI_SPLASH_MODEL"
 CTX="$CTX_SIZE_DEFAULT"
 _IMG="$(bonsai_image_max_pixels)"          # BONSAI_IMAGE_MAX_TOKENS -> pixels
 _IDLE="${BONSAI_IDLE_RELEASE:-off}"        # keep the model loaded (old behavior)
-_EFFORT="low"   # default thinking level when no reasoning flag is supplied
+# Default thinking level when no reasoning flag is supplied. Override with
+# BONSAI_REASONING_EFFORT (none|minimal|low|medium|high|xhigh|max); a legacy
+# --reasoning-budget CLI flag still wins over this.
+# `medium` is the model card's recommendation for a speed/accuracy balance.
+# NOT `low`: upstream states "low reasoning effort is not supported and when
+# selected the model will behave close to xhigh" — so `low` silently buys
+# near-maximum thinking on every request. `none` is fastest for
+# retrieval/reformat turns; the model's own default is `xhigh`.
+_EFFORT="medium"
+case "${BONSAI_REASONING_EFFORT:-medium}" in
+    none|minimal|low|medium|high|xhigh|max) _EFFORT="${BONSAI_REASONING_EFFORT:-medium}" ;;
+    *) warn "unknown BONSAI_REASONING_EFFORT='${BONSAI_REASONING_EFFORT}' (want none|minimal|low|medium|high|xhigh|max); using 'medium'." ;;
+esac
 SPLASH_ARGS=""
 _ANNOUNCE=0
 _DROPPED=""
@@ -133,6 +154,19 @@ _note_dropped() { _DROPPED="${_DROPPED:+$_DROPPED }$1"; }
 [ -n "${BONSAI_MAX_CACHE_DISK:-}" ] && SPLASH_ARGS="$SPLASH_ARGS --max-cache-disk $BONSAI_MAX_CACHE_DISK"
 case "${BONSAI_LANGUAGE_ONLY:-0}" in 1|true|yes|on) SPLASH_ARGS="$SPLASH_ARGS --language-only" ;; esac
 case "${BONSAI_OFFLINE:-0}" in 1|true|yes|on) SPLASH_ARGS="$SPLASH_ARGS --offline" ;; esac
+# Restart-proof prefix cache: keep the SSD cache across restarts so a context
+# change or upgrade does not lose cached prefixes (measured: a 6.4K prompt
+# replayed in 0.6 s after a restart vs 20.2 s fresh). Needs --max-cache-disk;
+# without it the flag is refused at startup, so warn and skip instead.
+case "${BONSAI_PERSISTENT_CACHE:-0}" in
+    1|true|yes|on)
+        if [ -n "${BONSAI_MAX_CACHE_DISK:-}" ]; then
+            SPLASH_ARGS="$SPLASH_ARGS --persistent-cache"
+            _CACHE_DIR_ARG=1
+        else
+            warn "BONSAI_PERSISTENT_CACHE=1 needs BONSAI_MAX_CACHE_DISK (e.g. 16G); persistent cache off."
+        fi ;;
+esac
 
 # Legacy llama.cpp-only env vars: accepted so old configs don't break, noted once.
 for _v in BONSAI_GGUF BONSAI_MMPROJ BONSAI_NGL BONSAI_SPECULATIVE BONSAI_MMPROJ_CPU BONSAI_LLAMA_VERBOSE; do
@@ -205,6 +239,13 @@ done
 if [ -n "$_PRE" ]; then
     warn "flag at end of command line is missing its value; dropped."
 fi
+# The prefix-cache path goes through "$@", not SPLASH_ARGS: SPLASH_ARGS is
+# expanded unquoted, so a checkout under a path with spaces (e.g. "Default
+# Project") would split into stray arguments and splash would refuse to start.
+if [ -n "${_CACHE_DIR_ARG:-}" ]; then
+    mkdir -p "$BONSAI_CACHE_DIR"
+    set -- "$@" --cache-dir "$BONSAI_CACHE_DIR"
+fi
 [ "$_ANNOUNCE" = "1" ] && SPLASH_ARGS="$SPLASH_ARGS --announce-served-name"
 [ -n "$_DROPPED" ] && warn "ignored llama.cpp-only settings: $_DROPPED"
 [ -n "$_NOTE" ] && echo "  Note: $_NOTE"
@@ -220,6 +261,9 @@ echo "  Engine:  $SPLASH"
 [ "${BONSAI_LANGUAGE_ONLY:-0}" = "1" ] \
     || echo "  Vision:  bundled with the model repo (images accepted)"
 echo "  Context: $CTX tokens (override with BONSAI_CTX, 0 = auto)"
+case "$SPLASH_ARGS" in
+    *--persistent-cache*) echo "  Prefix cache: persistent on SSD (${BONSAI_MAX_CACHE_DISK}, survives restarts)" ;;
+esac
 if [ -n "$_EFFORT" ]; then
     echo "  Thinking: default reasoning effort '$_EFFORT'"
 else
