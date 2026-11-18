@@ -201,6 +201,32 @@ st, _, body, _ = post("/responses", {"model": MODEL, "input": "say hi", "max_out
 ok = st == 200 and '"output_text"' in body if st == 200 else False
 log("/v1/responses round-trip", ok, f"status={st} body={body[:120]}")
 
+# An agent harness caps max_tokens per turn. Reasoning is spent from the same
+# budget, so a tool-carrying request must not come back empty (content "" and
+# finish_reason "length" with no tool call leaves the harness nothing to act
+# on). Verified failing at 4/4 before the proxy defaulted agent turns to
+# BONSAI_AGENT_EFFORT; see scripts/test_endpoint_agent.py for the full suite.
+AGENT_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "read_file",
+        "description": "Read a file",
+        "parameters": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        },
+    },
+}
+st, _, body, _ = post("/chat/completions",
+                      {"model": MODEL, "tools": [AGENT_TOOL], "max_tokens": 1024,
+                       "messages": [{"role": "user", "content": "Read src/app.py"}]})
+msg = (json.loads(body)["choices"][0].get("message") or {}) if st == 200 else {}
+acted = bool((msg.get("content") or "").strip() or msg.get("tool_calls"))
+log("agent turn with max_tokens=1024 produces content or a tool call",
+    st == 200 and acted, f"status={st} content_len={len(msg.get('content') or '')} "
+    f"tool_calls={len(msg.get('tool_calls') or [])}")
+
 print("\n" + "=" * 70)
 fails = [r for r in results if not r[1]]
 print(f"TOTAL: {len(results)} checks, {len(fails)} failed")

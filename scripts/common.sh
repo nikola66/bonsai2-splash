@@ -79,9 +79,12 @@ splash_bin() {
 # (up to 262144). BONSAI_CTX=0 or unset both mean "auto" and resolve to the
 # tiered default below; to force full training context pass e.g. BONSAI_CTX=262144.
 #
-# The 24 GB+ tier is 65536, not 32768: agent harnesses (Hermes) refuse a model
-# under a 64K context, and coding agents want the headroom. 24 GB pays ~1 GB
-# more KV for it (int8), well within the machine's plan.
+# The 24 GB+ tier is 131072, not 65536: agent harnesses (Hermes) refuse a model
+# under a 64K context, and real coding-agent sessions run at p90 44K / max 56K
+# input tokens, so 64K failed them mid-task with context_length_exceeded. The
+# 24 GB memory plan already reserves KV for ~180K tokens at int8, so 131072
+# costs no extra memory -- KV grows with use, not with the cap -- and leaves
+# ~27% of the reservation as headroom.
 bonsai_ctx_default() {
     # Treat 0 the same as unset ("auto"): never emit -c 0 downstream.
     if [ -n "${BONSAI_CTX:-}" ] && [ "$BONSAI_CTX" != "0" ]; then
@@ -98,8 +101,6 @@ bonsai_ctx_default() {
         echo 8192
     elif [ "$_mem_gb" -le 23 ] 2>/dev/null; then
         echo 16384
-    elif [ "$_mem_gb" -le 71 ] 2>/dev/null; then
-        echo 65536
     else
         echo 131072
     fi

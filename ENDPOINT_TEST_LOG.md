@@ -209,3 +209,65 @@ The embeddings assertions changed from "clear 501" to "serves Matryoshka
 vectors": both `test_endpoint.py` (§11) and `test_endpoint_clients.py` (§D) POST
 a real request with `dimensions` 256/128 and require 200 + the right vector
 counts, tolerating an honest 501/503 (disabled/still loading) with a note.
+
+---
+
+# Agent-loop investigation (2026-10-19)
+
+Prompted by agentic coding runs that stalled and were only resolved by switching
+to a frontier model. Source material: 950 recorded requests in
+`logs/bonsai-server.log` (450 of them tool-carrying, 6 sessions, up to 172 turns)
+and 1,720 lines in `logs/bonsai-server.err.log`.
+
+## What the logs showed
+
+| Finding | Evidence |
+|---|---|
+| **Empty turns on a tight `max_tokens`** | `reasoning_effort=low` + `max_tokens=1024` returned `content: ""` with `finish_reason: "length"` on 4/4 realistic agent tasks; reasoning tokens at `low` ranged 39 → 5082. The launcher's `--default-reasoning-effort low` applied to every harness that did not send an effort. |
+| **Context ceiling hit mid-task** | 23 `context_length_exceeded` 400s in bursts of 4–5 identical retries, then abandonment. Agent sessions ran p50 27,272 / p90 44,106 / max 56,078 input tokens against `.bonsai-ctx` = 65536, while `/status` already reserved KV for 180,224. |
+| **Prefix-cache misses dominated the tail** | 92.5% of prefill tokens were cache hits overall, but 12 requests were 28% of all TTFT (mean 64 s, max 115 s). 470 agent requests: TTFT 30% of wall time, decode 70%. |
+| **The miss trigger is a front-of-prompt change** | 5.4K-token probe: identical 0.22 s; timestamp appended to the system prompt 0.52 s; timestamp *prepended* 17.0 s; `tools` reordered 17.1 s; one tool appended 17.1 s. Tool definitions render at the front, so any list change discards every cached token behind it. |
+
+Ruled out (not defects): tool calling (parallel calls, `tool_choice` required and
+named, 24 tools, streaming, `content: null`, `format`, mid-conversation
+`system` all pass); the `invalid_request_error` bursts at fixed timestamps (these
+suites); ANE FFN (unavailable for PQ2_0's rotated tensors); `Memory: growth
+paused` (106 events, 98% cleared on the next log line, `waiting=0 suspended=0` —
+a consequence of long generations, not a cause); Low Power Mode (already off).
+
+## Fixes applied
+
+| Fix | Where |
+|---|---|
+| Tool-carrying requests with no `reasoning_effort` get `BONSAI_AGENT_EFFORT` (default `none`), so the budget goes to the answer instead of the scratchpad | `openai_proxy.py` (`_prepare_chat_request`) |
+| `tools` are sorted by function name before forwarding, so the rendered prefix depends on the tool *set*, not the order it arrived in | `openai_proxy.py` (`_canonical_tools`) |
+| Every chat request logs an 8-character `prefix` fingerprint, making a cache miss attributable | `openai_proxy.py` (`_prefix_fingerprint`, `_log_line`) |
+| `context_length_exceeded` carries `limit` and `requested_tokens_estimate`, so a harness can shrink instead of resending | `openai_proxy.py` (`_enrich_context_error`) |
+| Context default 65536 → **131072** (24 GB+ tier), including the launchd path | `scripts/common.sh`, `bonsai-service.sh`, `.bonsai-ctx` |
+| Ollama `/api/show` reports the live window instead of a hardcoded 65536 | `ollama_bridge.py` |
+
+Live verification (M6 24 GB, service restarted):
+
+| Check | Result |
+|---|---|
+| `maximum_context_tokens` | 131072 (KV capacity unchanged at 180224, so no extra memory) |
+| Reordered `tools`, 2.7K-token prompt | `cache_n` 2752/2771 (99%), TTFT 202 ms — was a full 17 s miss |
+| Agent turn, `tools`, no effort, `max_tokens=1024` | `finish_reason=tool_calls`, `reasoning_tokens=0` |
+| Explicit `reasoning_effort=low` | respected (not overridden) |
+| 140K-token prompt | `400` with `limit=131072`, `requested_tokens_estimate=214285` |
+| 20-turn loop, 17 tools | 0 empty turns, 0 context errors, 1.0 s/turn |
+
+Regression suites re-run against the live service:
+
+| Suite | Checks | Result |
+|---|---|---|
+| `scripts/test_endpoint.py` | 23 | 0 failed |
+| `scripts/test_endpoint_followup.py` | 11 | 0 failed |
+| `scripts/test_endpoint_probe3.py` | 9 | 0 failed |
+| `scripts/test_endpoint_clients.py` | 17 | 0 failed |
+| `scripts/test_endpoint_agent.py` (new) | 7 | 0 failed |
+| **Total** | **67** | **0 failed** |
+
+`scripts/test_endpoint_agent.py` is the new suite: empty-turn guard, effort
+override, tool-order cache invariance, actionable context refusal, advertised
+window, and a 20-turn / 17-tool loop.

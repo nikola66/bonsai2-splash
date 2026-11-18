@@ -18,7 +18,7 @@ bandwidth, thermals and background load.
 | Engine | Splash 1.3.0 |
 | Model | `prism-ml/Ternary-Bonsai-2-27B-gguf:PQ2_0` (6.75 GiB target weights) |
 | Draft | `incoai/Qwen3.8-27B-DFlash2`, 1.18 GiB, always on |
-| Context | 65536 (service default) |
+| Context | 131072 (service default; 65536 when these numbers were recorded) |
 | KV cache | `int8` |
 
 ## Results
@@ -114,6 +114,13 @@ At `int8` KV (Splash's default) the cache costs about **32 KiB per token**:
 Very long contexts on a tight machine can spill blocks to SSD with
 `BONSAI_MAX_CACHE_DISK=16G` (real disk writes) or trade precision for memory
 with `BONSAI_KV_FORMAT=bf16`, which doubles KV usage for a marginal quality gain.
+
+Two flags that look tempting but do nothing for this model (verified Oct 2026,
+Splash 1.3.0): `--disable-ane` — the engine already declines the ANE split for
+PQ2_0 itself (`/status` `ane_ffn.reason: "ANE FFN split needs affine Q4
+projections or unrotated quantized GGUF tensors"`; prefill identical to ±1%
+at 2K/8K/32K with the flag on or off); and `--state-format` — documented
+upstream but refused by Splash 1.3.0 (`unrecognized arguments`).
 
 Note that `ps` RSS understates the engine's real footprint — Splash memory-maps
 the weights, so the process tree showed 3.3 GB RSS while the working set was

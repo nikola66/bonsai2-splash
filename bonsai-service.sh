@@ -25,17 +25,16 @@ export BONSAI_HOST="${BONSAI_HOST:-127.0.0.1}"
 
 # Context window: the web UI writes a chosen value to .bonsai-ctx (through the
 # bridge's POST /bonsai/context) and restarts the server to apply it. An
-# explicit BONSAI_CTX env still wins; otherwise default to 65536.
-if [ -z "${BONSAI_CTX:-}" ]; then
-    BONSAI_CTX=65536
-    if [ -f "$DEMO_DIR/.bonsai-ctx" ] && grep -Eq '^[0-9]+$' "$DEMO_DIR/.bonsai-ctx"; then
-        _FILE_CTX="$(cat "$DEMO_DIR/.bonsai-ctx")"
-        if [ "$_FILE_CTX" -ge 8192 ] && [ "$_FILE_CTX" -le 262144 ]; then
-            BONSAI_CTX="$_FILE_CTX"
-        fi
+# explicit BONSAI_CTX env still wins; otherwise the slider value, and failing
+# that the RAM-tiered default from scripts/common.sh (131072 on 24 GB+).
+if [ -z "${BONSAI_CTX:-}" ] && [ -f "$DEMO_DIR/.bonsai-ctx" ] \
+        && grep -Eq '^[0-9]+$' "$DEMO_DIR/.bonsai-ctx"; then
+    _FILE_CTX="$(cat "$DEMO_DIR/.bonsai-ctx")"
+    if [ "$_FILE_CTX" -ge 8192 ] && [ "$_FILE_CTX" -le 262144 ]; then
+        BONSAI_CTX="$_FILE_CTX"
+        export BONSAI_CTX
     fi
 fi
-export BONSAI_CTX
 
 # Model: Splash serves prism-ml/Ternary-Bonsai-2-27B-gguf:PQ2_0 with its paired
 # DFlash2 speculative draft (always on) and the vision projector, loaded from

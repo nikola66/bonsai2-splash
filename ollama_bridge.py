@@ -778,7 +778,7 @@ class Handler(BaseHTTPRequestHandler):
             "system": "",
             "model_info": {
                 "general.architecture": "qwen3",
-                "general.context_length": 65536,
+                "general.context_length": _upstream_ctx() or _read_ctx_file() or 131072,
                 "general.file_type": info["quant"],
             },
         })

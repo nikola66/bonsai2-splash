@@ -20,6 +20,25 @@ behaviour the engine itself does not implement:
     which crashes clients that do message.content.strip(). The proxy answers
     "" instead (null stays legitimate when tool_calls are present, as OpenAI
     defines).
+  * **Prompt prefix stability.** Splash caches prefill by the longest common
+    prefix of the *rendered* prompt, and the tool list renders at the very
+    front of it. A client that reorders its tools -- map iteration order, a
+    sorted() call, an MCP server reconnecting -- invalidates every cached
+    token and pays a full re-prefill (measured 17 s on a 5.4K-token prompt,
+    up to 115 s on real 28K agent sessions). The proxy sorts `tools` by
+    function name on the way through, so the rendered prefix depends on the
+    tool *set* and not on the order it arrived in. Clients see the same
+    tools; only the prompt prefix becomes cacheable. Each chat request also
+    logs a short fingerprint of that prefix, so a miss is attributable
+    instead of mysterious.
+  * **Agent turns default to no thinking.** A reasoning budget is spent from
+    the same `max_tokens` the answer uses. Agent harnesses cap that at about
+    1K, so the launcher's `low` default burned the whole budget on reasoning
+    and returned `content: ""` with finish_reason "length" -- an empty
+    assistant turn, no tool call, and a stalled loop. When a request carries
+    tools and does not set `reasoning_effort`, the proxy sets
+    `BONSAI_AGENT_EFFORT` (default `none`) so the budget goes to the answer.
+    Plain /v1 calls and the chat page keep the server default.
   * **Path tolerance.** Clients are routinely given a base URL without the
     `/v1` suffix or with a trailing slash. The proxy canonicalizes both, so
     `/chat/completions`, `/v1/chat/completions`, `/v1/chat/completions/` and
@@ -48,12 +67,15 @@ git-ignored bonsai.env, which wins over defaults):
     BONSAI_ENGINE_PORT   engine port (default PORT + 1, loopback only)
     BONSAI_EMBED         enable /v1/embeddings (default 1; 0 answers 501)
     BONSAI_EMBED_PORT    embeddings service port (default 8082, loopback only)
+    BONSAI_AGENT_EFFORT  reasoning_effort for tool-carrying requests that set
+                         none of their own (default none; `off` disables)
 
 Started and stopped by scripts/start_llama_server.sh. Standard library only.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
@@ -99,6 +121,14 @@ EMBED = ("127.0.0.1", EMBED_PORT)
 EMBED_ENABLED = _setting("BONSAI_EMBED", "1").strip().lower() not in (
     "0", "false", "no", "off",
 )
+
+# reasoning_effort applied to tool-carrying requests that set none of their
+# own. `off` (or any non-effort value) disables the rewrite, leaving the
+# engine's --default-reasoning-effort in charge.
+_EFFORT_VALUES = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+AGENT_EFFORT = _setting("BONSAI_AGENT_EFFORT", "none").strip().lower()
+if AGENT_EFFORT not in _EFFORT_VALUES:
+    AGENT_EFFORT = ""
 
 # OpenAI requires `model` on its text routes; the engine accepts these
 # requests without one (only its Anthropic route validates the field).
@@ -644,6 +674,164 @@ def _normalize_chat(data: bytes) -> bytes:
     return json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode()
 
 
+def _canonical_tools(tools) -> bool:
+    """Sort a tool list by function name, in place. True when order changed.
+
+    Order carries no meaning to the model, but the list renders into the
+    front of the prompt, so it decides whether the engine can reuse its
+    prefix cache. Only lists whose entries all have a usable name are
+    touched; anything else is forwarded exactly as it arrived.
+    """
+    if not isinstance(tools, list) or len(tools) < 2:
+        return False
+    names: list[str] = []
+    for tool in tools:
+        fn = tool.get("function") if isinstance(tool, dict) else None
+        name = fn.get("name") if isinstance(fn, dict) else None
+        if not isinstance(name, str) or not name:
+            return False
+        names.append(name)
+    if names == sorted(names):
+        return False
+    tools.sort(key=lambda tool: tool["function"]["name"])
+    return True
+
+
+def _prefix_fingerprint(parsed: dict) -> str:
+    """8 hex chars over the parts of the prompt that render first.
+
+    System messages and tool definitions are what the engine's prefix cache
+    keys on, so a change here is the difference between a 0.2 s turn and a
+    two-minute one. Logging the hash makes that attributable.
+    """
+    parts: list = []
+    messages = parsed.get("messages")
+    if isinstance(messages, list):
+        for message in messages:
+            if isinstance(message, dict) and message.get("role") == "system":
+                parts.append(message.get("content"))
+            elif isinstance(message, dict) and message.get("role") != "system":
+                # Only the leading run of system messages renders first; a
+                # system message after the first user turn is not part of
+                # the cached prefix.
+                break
+    tools = parsed.get("tools")
+    if isinstance(tools, list):
+        parts.append(tools)
+    try:
+        blob = json.dumps(parts, ensure_ascii=False, sort_keys=True,
+                          separators=(",", ":"))
+    except (TypeError, ValueError):
+        return ""
+    return hashlib.sha1(blob.encode("utf-8", "replace")).hexdigest()[:8]
+
+
+def _prepare_chat_request(body: bytes, parsed) -> tuple[bytes, str, list[str]]:
+    """Normalize a chat request for the engine's prompt cache and agent use.
+
+    Returns the body to forward, a prefix fingerprint for the log, and the
+    list of normalizations applied (also for the log).
+    """
+    if not isinstance(parsed, dict):
+        return body, "", []
+    notes: list[str] = []
+    changed = False
+    tools = parsed.get("tools")
+    has_tools = isinstance(tools, list) and len(tools) > 0
+    if has_tools and _canonical_tools(tools):
+        notes.append("tools sorted")
+        changed = True
+    if has_tools and AGENT_EFFORT and "reasoning_effort" not in parsed:
+        parsed["reasoning_effort"] = AGENT_EFFORT
+        notes.append(f"effort={AGENT_EFFORT}")
+        changed = True
+    fingerprint = _prefix_fingerprint(parsed)
+    if changed:
+        body = json.dumps(parsed, ensure_ascii=False, separators=(",", ":")).encode()
+    return body, fingerprint, notes
+
+
+def _context_limit() -> int | None:
+    """The served context window, as configured for this launch.
+
+    Read from the environment the launcher exports, then from the slider's
+    file; None when neither is readable, in which case the error body is left
+    alone rather than carrying a wrong number.
+    """
+    raw = os.environ.get("BONSAI_CTX", "").strip()
+    if not raw:
+        try:
+            raw = (DEMO_DIR / ".bonsai-ctx").read_text().strip()
+        except OSError:
+            return None
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+def _estimate_tokens(parsed: dict) -> int | None:
+    """A rough prompt size, so a refusal can say how much is over.
+
+    Deliberately approximate (~3.5 characters per token for English and
+    code): the engine does not echo its real count, and a harness deciding
+    how much history to drop needs a magnitude, not an exact figure.
+    """
+    chars = 0
+    messages = parsed.get("messages")
+    if isinstance(messages, list):
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            content = message.get("content")
+            if isinstance(content, str):
+                chars += len(content)
+            elif isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and isinstance(part.get("text"), str):
+                        chars += len(part["text"])
+            for call in message.get("tool_calls") or ():
+                if isinstance(call, dict):
+                    chars += len(json.dumps(call.get("function") or {}))
+    tools = parsed.get("tools")
+    if isinstance(tools, list):
+        chars += len(json.dumps(tools))
+    if not chars:
+        return None
+    return int(chars / 3.5)
+
+
+def _enrich_context_error(data: bytes, parsed) -> bytes:
+    """Add `limit` and a size estimate to a context-length refusal.
+
+    The engine's body says only "prompt exceeds the context window", which
+    tells a harness nothing about how much to drop -- so it resends the same
+    payload and fails again (observed as bursts of four or five identical
+    400s per session, then abandonment of the task).
+    """
+    try:
+        obj = json.loads(data)
+    except ValueError:
+        return data
+    err = obj.get("error") if isinstance(obj, dict) else None
+    if not isinstance(err, dict) or err.get("code") != "context_length_exceeded":
+        return data
+    limit = _context_limit()
+    if limit is not None:
+        err["limit"] = limit
+    estimate = _estimate_tokens(parsed) if isinstance(parsed, dict) else None
+    if estimate is not None:
+        err["requested_tokens_estimate"] = estimate
+        if limit is not None and estimate > limit:
+            err["message"] = (
+                f"prompt is roughly {estimate} tokens against a {limit}-token "
+                f"context window; drop at least ~{estimate - limit} tokens of "
+                f"history or raise BONSAI_CTX"
+            )
+    return json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode()
+
+
 class ProxyHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "bonsai-openai-proxy"
@@ -856,6 +1044,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
     # ── the proxy itself ─────────────────────────────────────────────────────
     def _relay(self) -> None:
         self._started = False
+        # Per-request log context: one handler serves many keep-alive
+        # requests, so these must not leak between them.
+        self._prefix = ""
+        self._notes: list[str] = []
         conn: HTTPConnection | None = None
         t0 = time.monotonic()
         method = self.command
@@ -950,6 +1142,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
             stream = isinstance(parsed, dict) and bool(parsed.get("stream"))
 
+            # Stabilise the prompt prefix and default tool-carrying turns to
+            # the agent effort before anything reaches the engine.
+            if path == "/v1/chat/completions" and isinstance(parsed, dict):
+                body, self._prefix, self._notes = _prepare_chat_request(body, parsed)
+
             # Headers, re-framed for one hop; the client's Host is forwarded
             # verbatim (the engine validates it) and Accept-Encoding is
             # dropped so bodies arrive identity-coded. Origin is dropped too:
@@ -981,7 +1178,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 return
             self._started = True  # headers will be forwarded below
 
-            if stream:
+            if stream and resp.status == 200:
                 self._pipe(resp)
                 self._log_line(path, resp.status, t0, "streamed")
                 return
@@ -1002,6 +1199,16 @@ class ProxyHandler(BaseHTTPRequestHandler):
             data = resp.read()
             ctype = resp.getheader("Content-Type", "")
             encoded = resp.getheader("Content-Encoding")
+
+            # A context refusal is the one error a harness must act on rather
+            # than retry: give it the limit and a size to aim for.
+            if (
+                resp.status == 400
+                and not encoded
+                and path == "/v1/chat/completions"
+                and "json" in ctype
+            ):
+                data = _enrich_context_error(data, parsed)
 
             # A known-unimplemented OpenAI route: the engine's bare 404 reads
             # as a routing bug in client logs, so answer explicitly.
@@ -1090,7 +1297,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
         if status < 400 and path not in MODEL_REQUIRED:
             return
         ms = (time.monotonic() - t0) * 1000
-        suffix = f" ({note})" if note else ""
+        extra = [note] if note else []
+        fingerprint = getattr(self, "_prefix", "")
+        if fingerprint:
+            extra.append(f"prefix {fingerprint}")
+        extra.extend(getattr(self, "_notes", ()))
+        suffix = f" ({', '.join(extra)})" if extra else ""
         _log(f"{status} {path} {ms:.0f}ms{suffix}")
 
     # ── methods ──────────────────────────────────────────────────────────────

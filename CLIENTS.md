@@ -11,8 +11,8 @@ configs for the clients the demo targets, plus the caveats worth knowing.
 | Base URL | `http://localhost:8080/v1` |
 | API key | **any non-empty string** — the server has no auth, e.g. `bonsai` |
 | Model id | `bonsai-2-27b` |
-| Context window | `65536` (raise with the chat-page slider or `BONSAI_CTX`) |
-| Max output | `8192` is a safe client-side default |
+| Context window | `131072` (the chat-page slider or `BONSAI_CTX` can change it) |
+| Max output | `8192` — set this explicitly, see [Agent clients](#agent--tool-calling-clients) |
 
 `prism-ml/Ternary-Bonsai-2-27B-gguf:PQ2_0` also resolves to the same model if a
 client insists on the full repo id.
@@ -27,6 +27,56 @@ Embeddings are served too, by a separate EmbeddingGemma 2 model — send
 
 If you exposed the server on a VPN/LAN address (see the README), the same URL
 works with that host: `http://<your-address>:8080/v1`. Loopback always works too.
+
+## Agent / tool-calling clients
+
+Two things decide whether an agent loop is pleasant or abandoned, and both are
+client-side settings rather than hardware.
+
+**1. `max_tokens` must cover the thinking, or the turn comes back empty.**
+
+`reasoning_effort` is spent from the same `max_tokens` budget the answer uses.
+At `low` a single turn can spend 5,000 tokens thinking before writing anything,
+so a client that caps output at 1,024 gets `content: ""` with
+`finish_reason: "length"` — no text, no tool call, and a loop that stalls with
+no error to react to. Measured on this box: `max_tokens: 1024` at `low` produced
+an empty turn on 4 of 4 realistic agent tasks.
+
+| Setting | Value |
+|---|---|
+| `max_tokens` | `8192` (**not** 512–1024) |
+| `reasoning_effort` | `none` for tool-call turns |
+
+Requests that carry a `tools` array and do **not** set `reasoning_effort` get
+`none` automatically (`BONSAI_AGENT_EFFORT`, default `none`). Plain `/v1` calls
+and the chat page keep the server default (`low`), so nothing changes for chat.
+
+**2. Keep the prompt prefix stable, or pay a full re-prefill.**
+
+The engine caches prefill by the longest common prefix of the *rendered*
+prompt, and system messages plus tool definitions render at the very front of
+it. Change anything there and every cached token behind it is discarded. On a
+5.4K-token prompt:
+
+| What changed | Time to first token |
+|---|---|
+| nothing (repeat) | 0.2 s |
+| appended to the **end** of the system prompt | 0.5 s |
+| timestamp **prepended** to the system prompt | **17.0 s** |
+| tools **reordered** | **17.1 s** |
+| one tool **appended** | **17.1 s** |
+
+Real agent sessions at 28K tokens paid up to **115 s** for this. So:
+
+- Put volatile content (clock, cwd, `git status`, todo/plan state, attached file
+  list) at the **end** of the system prompt or the end of the message list —
+  never the front.
+- Keep the tool list fixed for the life of a session. The proxy sorts `tools` by
+  function name before they reach the engine, so a client whose map iteration
+  order varies is already safe; adding or removing a tool mid-session is not.
+- The proxy logs an 8-character fingerprint of that prefix on every chat
+  request (`prefix a1b2c3d4`). Two turns with the same fingerprint cannot have
+  missed the cache; a changed fingerprint names the turn that broke it.
 
 ## Generic OpenAI SDK / curl
 
@@ -66,12 +116,12 @@ model:
   provider: custom
   base_url: http://localhost:8080/v1
   api_key: bonsai          # any non-empty value
-  context_length: 65536
+  context_length: 131072
   api_mode: chat_completions
 ```
 
-- Hermes **rejects models advertising fewer than 64,000 tokens**, so it needs
-  the 65536 default (or a larger `BONSAI_CTX`). If auto-detection from
+- Hermes **rejects models advertising fewer than 64,000 tokens**; this server
+  advertises 131072, so auto-detection works. If auto-detection from
   `/v1/models` is off, the explicit `context_length` above covers it.
 - `api_mode: chat_completions` is the right mode; `anthropic_messages` and
   `codex_responses` are not applicable.
@@ -102,7 +152,7 @@ Add a provider under `models.providers` (in `~/.openclaw/openclaw.json`, or via
             name: "Bonsai 2 27B (local)",
             reasoning: true,
             input: ["text", "image"],
-            contextWindow: 65536,
+            contextWindow: 131072,
             maxTokens: 8192,
             cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
           },
@@ -139,7 +189,7 @@ restart VS Code:
 | `apiType` | `chat-completions` |
 | `toolCalling` | `true` (agent mode needs this) |
 | `vision` | `true` |
-| `maxInputTokens` | `65536` |
+| `maxInputTokens` | `131072` |
 | `maxOutputTokens` | `8192` |
 
 Keep VS Code's generated `${apiKey}` input reference rather than pasting the key
@@ -164,7 +214,7 @@ Add a custom provider (in `opencode.json`, or `~/.config/opencode/opencode.json`
       "models": {
         "bonsai-2-27b": {
           "name": "Bonsai 2 27B",
-          "limit": { "context": 65536, "output": 8192 },
+          "limit": { "context": 131072, "output": 8192 },
           "tool_call": true,
           "reasoning": true
         }
@@ -212,12 +262,17 @@ curl -s http://localhost:8080/v1/embeddings -H 'Content-Type: application/json' 
 
 | Symptom | Cause / fix |
 |---|---|
+| Empty answer, `finish_reason: length`, no tool call | Reasoning shares the output budget and ran out before the answer. Set `max_tokens: 8192`; agent turns already default to `reasoning_effort: none` when they carry `tools`. |
+| `400 context_length_exceeded` | The conversation outgrew the window. The error now carries `limit` and `requested_tokens_estimate`, so the client knows how much to drop; the window can also be raised with the chat-page slider or `BONSAI_CTX` (restart, ~12–14 s). |
+| One turn takes 30–120 s, the rest are fast | A prefix-cache miss, not a slow model. Something changed at the *front* of the prompt — see [Agent clients](#agent--tool-calling-clients). Compare the `prefix` fingerprints in the proxy log for the two turns. |
+| Every turn is slower than the last | Expected: decode runs at 54 tok/s under 4K context and ~28 tok/s past 49K. Compaction, or fewer tools, is cheaper than more context. |
 | Truncated or empty answer, `finish_reason: length` | Reasoning shares the output budget. Send `reasoning_effort: "none"` for quick turns, or raise `max_tokens`. The server never returns `content: null` on a text reply (it normalizes to `""`). |
 | `404` with a client base URL | Give the full base including `/v1` (e.g. `http://localhost:8080/v1`). The proxy also accepts the routes without `/v1` and with a trailing slash, but some clients add their own path segments. |
 | `400 model is required` | The client omitted `model`; every request must name `bonsai-2-27b`. |
 | Embeddings / RAG feature fails | Shouldn't: `/v1/embeddings` works out of the box (EmbeddingGemma 2 via MLX). A **501** means embeddings are off (`BONSAI_EMBED=0`, or `mlx-vlm` missing from `.venv`); a **503** right after a restart means the ~580 MB model is still loading. |
-| Context looks too small | Default is 65536. Move the chat page's context slider (writes `.bonsai-ctx`) or set `BONSAI_CTX`; changing it restarts the server (~12–14 s). |
+| Context looks too small | Default is 131072. Move the chat page's context slider (writes `.bonsai-ctx`) or set `BONSAI_CTX`; changing it restarts the server (~12–14 s). |
 | Reasoning text appears in the answer | `reasoning_content` is a separate field; clients that ignore it show only the answer. To reduce it, lower `reasoning_effort` per request. |
+| Multi-turn chats get slower each turn | `preserve_thinking` is on by default: every turn's scratchpad stays in history, so prefill grows (measured: replaying 30 thinking tokens cost ~10% extra prefill on a tiny prompt — at `xhigh` with thousands of tokens it dominates). For long agent loops, send `preserve_thinking: false` or drop `reasoning_content` from replayed assistant messages. The proxy forwards the field untouched. |
 | Images come back low-detail | The vision cap is 1024 tokens/image by default. Set `BONSAI_IMAGE_MAX_TOKENS=0` for full detail (4096). |
 
 Browser apps on another origin are fine: the proxy answers CORS preflight and
